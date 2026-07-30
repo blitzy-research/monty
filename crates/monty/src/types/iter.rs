@@ -13,6 +13,13 @@
 //! ## Builtin Support
 //!
 //! The `iterator_next()` helper implements the `next()` builtin.
+//!
+//! `MontyIter::init()` implements both forms of the `iter()` builtin. Alongside the
+//! container-backed iterators above, the two-argument form `iter(callable, sentinel)`
+//! produces a *callable-driven* iterator: instead of walking a container it invokes
+//! `callable()` with no arguments on every step and stops as soon as the produced value
+//! compares equal to the sentinel. That variant is the only one that re-enters the VM
+//! while advancing, so it is the only one whose `advance()` path can push a frame.
 
 use std::mem;
 
@@ -33,6 +40,22 @@ use crate::{
 /// Uses index-based iteration to avoid borrow conflicts when accessing the heap.
 ///
 /// For strings, stores the string content with a byte offset for O(1) UTF-8 iteration.
+///
+/// # Foot-gun: `value` is not always the iterated object
+///
+/// `value` exists so the garbage collector can reach everything the iterator keeps alive —
+/// `value()` is the single edge `collect_child_ids` follows for `HeapData::Iter`. It is
+/// therefore whatever the variant needs traced, not necessarily the iterable:
+///
+/// - `Range` and `IterStr` copy their state out, so `value` is set to `Value::None` and the
+///   source object is released immediately (see [`MontyIter::new`]).
+/// - `HeapRef` holds the iterated container, mirrored by `IterValue::HeapRef::heap_id`.
+/// - `CallableSentinel` holds a **two-element pair tuple** `[callable, sentinel]` rather than
+///   either value directly. That iterator owns two values while the collector traces only
+///   one, so the pair tuple bridges the gap: the `HeapData::Iter` arm reaches the tuple and
+///   the `HeapData::Tuple` arm reaches both elements transitively. This keeps mark-and-sweep
+///   sound with no change to `heap.rs` and no change to the lifecycle methods below, all of
+///   which route through `value` alone.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MontyIter {
     /// Current iteration index, shared across all iterator types.
@@ -48,16 +71,61 @@ impl MontyIter {
     ///
     /// - `iter(iterable)` - Returns an iterator for the iterable. If the argument is
     ///   already an iterator, returns the same object.
-    /// - `iter(callable, sentinel)` - Not yet supported.
+    /// - `iter(callable, sentinel)` - Returns a callable-driven iterator. On every step it
+    ///   invokes `callable` with **no** arguments; if the produced value compares equal to
+    ///   `sentinel` iteration stops with `StopIteration` and that value is **not** yielded,
+    ///   otherwise the value is yielded. The stop test is `==` rich value comparison
+    ///   ([`Value::py_eq`]), never identity, so `3.0` stops against an integer sentinel `3`
+    ///   and a `[]` sentinel stops against a freshly built empty list. The result is
+    ///   self-iterable and exceptions raised by `callable` propagate unchanged.
+    ///
+    /// Both forms accept one or two **positional-only** arguments; the argument-count errors
+    /// are produced by `ArgValues::get_one_two_args` and already match CPython byte for byte.
+    ///
+    /// # Foot-guns
+    ///
+    /// - `callable` is **never** invoked here. CPython calls it zero times at construction,
+    ///   and the VM's `CallBuiltinType` dispatch arm relies on this constructor being unable
+    ///   to push a frame ("IP sync deferred to error path"). Do not pre-fetch a first value.
+    /// - Callability is validated **eagerly**, matching CPython's `iter(v, w): v must be
+    ///   callable`, so a bad first argument fails at construction rather than on first use.
     pub fn init(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         let (iterable, sentinel) = args.get_one_two_args("iter", vm.heap)?;
 
         if let Some(s) = sentinel {
-            // Two-argument form: iter(callable, sentinel)
-            // This is the sentinel iteration protocol, not yet supported
-            iterable.drop_with_heap(vm);
-            s.drop_with_heap(vm);
-            return Err(ExcType::type_error("iter(callable, sentinel) is not yet supported"));
+            // Two-argument form: iter(callable, sentinel) - the sentinel iteration protocol.
+            // CPython validates callability eagerly, before the iterator even exists, so a
+            // non-callable first argument must fail here rather than on the first `next()`.
+            if !Self::is_callable(&iterable, vm) {
+                // Single linear path with no branching, so direct drops are appropriate here.
+                iterable.drop_with_heap(vm);
+                s.drop_with_heap(vm);
+                return Err(ExcType::type_error("iter(v, w): v must be callable"));
+            }
+
+            // Move both values into a two-element pair tuple and keep only that reference in
+            // `value`. `allocate_tuple` takes the `SmallVec` by value, so this transfers
+            // ownership without cloning, and the pair is stored inline (TUPLE_INLINE_CAPACITY
+            // is 3). Routing the callable and sentinel through a tuple is what makes them
+            // reachable from `collect_child_ids`, which only traces `MontyIter::value` - see
+            // the `MontyIter` and `IterValue::CallableSentinel` docs for the full rationale.
+            let value = super::allocate_tuple(smallvec::smallvec![iterable, s], vm.heap)?;
+            let Value::Ref(pair) = value else {
+                panic!("iter(callable, sentinel): allocate_tuple must return a heap reference for a non-empty pair")
+            };
+
+            // Build the iterator directly rather than via `Self::new`, which derives its
+            // `IterValue` from `IterValue::from_heap_data` and must not learn about this
+            // variant (doing so would change every `MontyIter::new` call site). `value` is
+            // moved in, so the single owning reference to the pair lives in exactly one place.
+            // The callable is deliberately NOT invoked: construction must stay frame-push-free.
+            let iter = Self {
+                index: 0,
+                iter_value: IterValue::CallableSentinel { pair, done: false },
+                value,
+            };
+            let id = vm.heap.allocate(HeapData::Iter(iter))?;
+            return Ok(Value::Ref(id));
         }
 
         // Check if already an iterator - return self
@@ -72,6 +140,35 @@ impl MontyIter {
         let iter = Self::new(iterable, vm)?;
         let id = vm.heap.allocate(HeapData::Iter(iter))?;
         Ok(Value::Ref(id))
+    }
+
+    /// Returns whether `value` can be invoked, for the eager check in `iter(callable, sentinel)`.
+    ///
+    /// # Foot-gun: this must stay in step with `VM::call_function`
+    ///
+    /// `VM::call_function` (and `VM::call_heap_callable`, which it delegates to for heap values)
+    /// is the **single source of truth** for what monty can call. This predicate mirrors the
+    /// exact set those two accept and exists only so the two-argument `iter()` form can reject a
+    /// bad first argument at construction time, the way CPython does. If a new callable kind is
+    /// ever added there, it must be added here too, otherwise `iter()` will reject something the
+    /// interpreter is perfectly able to call.
+    ///
+    /// Answering `true` guarantees dispatch succeeds, not that the call will complete: external
+    /// functions are callable yet still fail inside `VM::evaluate_function`, an inherited
+    /// limitation shared with `map`, `filter` and `sorted`.
+    fn is_callable(value: &Value, vm: &VM<'_, '_, impl ResourceTracker>) -> bool {
+        match value {
+            // Immediates dispatched directly by `VM::call_function`. `Value::Builtin` covers all
+            // three callable builtin kinds (functions, exception types and types), so `len`,
+            // `ValueError` and `int` are all legitimate callables.
+            Value::Builtin(_) | Value::ModuleFunction(_) | Value::DefFunction(_) | Value::ExtFunction(_) => true,
+            // Heap values routed to `VM::call_heap_callable`, which accepts exactly these three.
+            Value::Ref(heap_id) => matches!(
+                vm.heap.get(*heap_id),
+                HeapData::Closure(_) | HeapData::FunctionDefaults(_) | HeapData::ExtFunction(_)
+            ),
+            _ => false,
+        }
     }
 
     /// Creates a new MontyIter from a Value.
@@ -196,6 +293,32 @@ impl MontyIter {
                 self.index += 1;
                 Ok(Some(item))
             }
+            IterValue::CallableSentinel { pair, done } => {
+                // NOTE: this arm is currently unreachable. `IterValue::CallableSentinel` is only
+                // ever produced by `MontyIter::init`, and `IterValue::from_heap_data` returns
+                // `None` for `HeapData::Iter`, so `MontyIter::new` - the only route into a bare
+                // `MontyIter` - can never build one. It is implemented correctly rather than left
+                // as `unreachable!()` so the two advance paths cannot silently diverge if that
+                // ever changes. `HeapRead::advance` is the path Python code actually takes.
+                //
+                // Unlike `advance`, `self` and `vm` are disjoint parameters here, so no borrow
+                // window juggling is needed: `vm` can be handed to the nested call directly.
+                if *done {
+                    return Ok(None);
+                }
+                let pair = *pair;
+                if let Some(value) = callable_sentinel_step(vm, pair)? {
+                    // `index` is a disjoint field, so it can be bumped while `iter_value` is borrowed.
+                    self.index += 1;
+                    Ok(Some(value))
+                } else {
+                    // Exhaustion is sticky, and is recorded ONLY on sentinel equality. An error
+                    // from the step above propagated via `?` and never reaches here, leaving
+                    // the iterator live for the next call - exactly as CPython behaves.
+                    *done = true;
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -204,6 +327,8 @@ impl MontyIter {
     /// For immutable types (Range, Tuple, Str, Bytes, FrozenSet), returns the exact remaining count.
     /// For List, returns current length minus index (may change if list is mutated).
     /// For Dict and Set, returns the captured length minus index (used for size-change detection).
+    /// For callable-driven iterators the remaining count is unknowable, so this reports 0, which is
+    /// also what CPython's `operator.length_hint(iter(lambda: 1, 0))` returns.
     pub fn size_hint(&self, heap: &Heap<impl ResourceTracker>) -> usize {
         let len = match &self.iter_value {
             IterValue::Range { len, .. } | IterValue::IterStr { len, .. } | IterValue::InternBytes { len, .. } => *len,
@@ -216,6 +341,10 @@ impl MontyIter {
                     list.len()
                 })
             }
+            // A callable-driven iterator has no length: only calling the callable reveals whether
+            // another value exists. Reported as 0 so capacity hints stay conservative. Unreachable
+            // in practice, since `collect()` is only ever reached from `MontyIter::new`.
+            IterValue::CallableSentinel { .. } => 0,
         };
         len.saturating_sub(self.index)
     }
@@ -317,6 +446,67 @@ impl<'h> HeapRead<'h, MontyIter> {
                 self.get_mut(vm.heap).index += 1;
                 Ok(Some(item))
             }
+            // Binds nothing on purpose: `get_mut` borrows `vm.heap` (not `self`) for as long as any
+            // binding taken from `this` is live, and this arm must hand `&mut vm` to a nested VM
+            // call. With no bindings, non-lexical lifetimes end that borrow right here, freeing
+            // `vm`. The helper then re-opens two short windows of its own.
+            IterValue::CallableSentinel { .. } => self.advance_callable_sentinel(vm),
+        }
+    }
+
+    /// Advances a callable-driven `iter(callable, sentinel)` iterator.
+    ///
+    /// Split out of `advance` because it is the only advance path that re-enters the VM: invoking
+    /// the callable can push a frame and run a nested `run()` loop. That makes the heap borrow
+    /// window the central concern, so the body is deliberately structured as **two short windows**
+    /// around the call, mirroring how the `HeapRef` arm copies its state out before calling
+    /// `get_heap_item` and re-acquires afterwards:
+    ///
+    /// 1. read the two `Copy` fields (`pair`, `done`) and let the borrow end,
+    /// 2. step with no heap borrow live at all,
+    /// 3. re-acquire to persist the outcome.
+    ///
+    /// # Foot-guns
+    ///
+    /// - Never hold anything derived from `get_mut`/`get` across the step. Doing so would either
+    ///   fail to compile or, worse, alias heap data across a nested interpreter run.
+    /// - The reader this `HeapRead` holds on the *iterator* entry may safely stay alive across the
+    ///   step: `dec_ref` only asserts on readers when it would actually free an entry, and both
+    ///   callers keep the iterator alive for the whole call (`ForIter` peeks rather than pops, and
+    ///   `iterator_next` holds it as the live argument).
+    /// - `done` is written **only** on the `Ok(None)` path. An error propagates out via `?` before
+    ///   step 3, so a raised exception leaves the iterator usable, matching CPython.
+    fn advance_callable_sentinel(&mut self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
+        // Window 1: copy the state out, then let the borrow on `vm.heap` end immediately.
+        let (pair, done) = match &self.get(vm.heap).iter_value {
+            IterValue::CallableSentinel { pair, done } => (*pair, *done),
+            _ => panic!("advance_callable_sentinel: iterator is not callable-driven"),
+        };
+
+        // Sticky exhaustion: once stopped, the callable must never be invoked again, so that a
+        // second `next()` raises `StopIteration` and `next(it, default)` returns the default
+        // without any further call.
+        if done {
+            return Ok(None);
+        }
+
+        // No heap borrow is live here, which is what makes re-entering the VM sound.
+        let stepped = callable_sentinel_step(vm, pair)?;
+
+        // Window 2: persist the outcome.
+        let this = self.get_mut(vm.heap);
+        if let Some(value) = stepped {
+            this.index += 1;
+            Ok(Some(value))
+        } else {
+            // Exhaustion is sticky and is recorded ONLY here, on sentinel equality. An error from
+            // the step above already propagated via `?` before this point, so a raised exception
+            // leaves `done` false and the iterator usable - exactly as CPython behaves.
+            let IterValue::CallableSentinel { done, .. } = &mut this.iter_value else {
+                panic!("advance_callable_sentinel: iterator is not callable-driven");
+            };
+            *done = true;
+            Ok(None)
         }
     }
 }
@@ -413,6 +603,68 @@ fn get_heap_item(
     }
 }
 
+/// Performs one step of a callable-driven `iter(callable, sentinel)` iterator.
+///
+/// Invokes the callable with zero arguments and compares the result to the sentinel using `==`
+/// rich value comparison. Returns `Ok(None)` when the sentinel is reached (the produced value is
+/// released and deliberately **not** yielded, matching CPython) and `Ok(Some(value))` otherwise.
+///
+/// # Foot-guns
+///
+/// - **No heap borrow may be live when this is called.** It re-enters the VM via
+///   `VM::evaluate_function`, which can push a frame and run a nested `run()` loop - the only
+///   iterator advance path in the interpreter that does. Callers must close their `get_mut`
+///   window first; see `HeapRead::<MontyIter>::advance_callable_sentinel`.
+/// - Errors from the callable and from the comparison propagate untouched via `?`, which is what
+///   makes exception transparency automatic. Consequently this function must **not** record
+///   exhaustion - the caller sets `done` only when `Ok(None)` is returned, so a propagated
+///   exception leaves the iterator live exactly as CPython does.
+/// - External callables are rejected by `VM::evaluate_function` with an internal error
+///   ("external functions are not yet supported in this context"). That limitation is inherited
+///   verbatim from `map`, `filter` and `sorted` and is not addressed here.
+fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapId) -> RunResult<Option<Value>> {
+    // Guard the owned clones as one unit so every exit path - including `?` from the call and
+    // from the comparison - releases both. Manual drops would leak here: there are four distinct
+    // exits between acquiring these values and releasing them.
+    let mut owned_guard = HeapGuard::new(callable_sentinel_pair(vm, pair), vm);
+    let ((callable, sentinel), vm) = owned_guard.as_parts();
+
+    let produced = vm.evaluate_function("iter(callable, sentinel)", callable, ArgValues::Empty)?;
+
+    // The produced value needs its own guard because its fate is conditional: released when it
+    // equals the sentinel, handed back to the caller otherwise, and released if the comparison
+    // itself fails. Declared after `owned_guard` so it is dropped first.
+    let mut produced_guard = HeapGuard::new(produced, vm);
+    let (produced, vm) = produced_guard.as_parts();
+    if produced.py_eq(sentinel, vm)? {
+        // Sentinel reached: the guard releases the value, which is never yielded.
+        return Ok(None);
+    }
+    Ok(Some(produced_guard.into_inner()))
+}
+
+/// Reads the `[callable, sentinel]` pair tuple backing a callable-driven iterator.
+///
+/// Returns owned clones of both values, reference counted via `clone_with_heap` so the caller can
+/// use them after the heap borrow ends. Takes `&VM` immutably and deliberately does **not** open
+/// a `HeapRead<Tuple>`, so no reader count is taken on the pair and no `dec_ref` panic can
+/// originate here.
+///
+/// # Panics
+///
+/// Panics if `pair` is not a two-element tuple. That is a programmer error rather than a runtime
+/// condition: `MontyIter::init` is the only producer of `IterValue::CallableSentinel` and it
+/// always allocates exactly `[callable, sentinel]`.
+fn callable_sentinel_pair(vm: &VM<'_, '_, impl ResourceTracker>, pair: HeapId) -> (Value, Value) {
+    let HeapData::Tuple(tuple) = vm.heap.get(pair) else {
+        panic!("callable_sentinel_pair: expected the iter(callable, sentinel) pair tuple")
+    };
+    let [callable, sentinel] = tuple.as_slice() else {
+        panic!("callable_sentinel_pair: the iter(callable, sentinel) pair must hold exactly two items")
+    };
+    (callable.clone_with_heap(vm), sentinel.clone_with_heap(vm))
+}
+
 /// Gets the next item from an iterator.
 ///
 /// If the iterator is exhausted:
@@ -504,6 +756,26 @@ enum IterValue {
         len: Option<usize>,
         checks_mutation: bool,
     },
+    /// Iterating by repeatedly calling a callable until it returns the sentinel.
+    ///
+    /// Produced only by the two-argument `iter(callable, sentinel)` form. Unlike every other
+    /// variant this one has no length and no backing container: each step re-enters the VM to
+    /// invoke the callable, then compares the result to the sentinel with `==`.
+    ///
+    /// # Foot-guns
+    ///
+    /// - `pair` is a **non-owning mirror** of the `HeapId` already owned by `MontyIter.value`,
+    ///   exactly as `HeapRef::heap_id` mirrors it. It is *not* separately reference counted, so
+    ///   it must never be dropped, cloned into a `Value`, or outlive `MontyIter.value`. The
+    ///   entry it points at is a two-element tuple `[callable, sentinel]`; storing the pair
+    ///   there (instead of two `Value` fields here) is what lets the garbage collector reach
+    ///   both owned values through the pre-existing `HeapData::Iter` → `HeapData::Tuple`
+    ///   traversal arms, and is why no `Value` is held inline despite the `Clone` derive.
+    /// - `done` is **sticky** and is set **only** when a produced value compares equal to the
+    ///   sentinel. An exception escaping the callable must leave it `false` so the iterator
+    ///   stays live, matching CPython, where the next `next()` after a propagated error
+    ///   succeeds. Once set, the callable is never invoked again.
+    CallableSentinel { pair: HeapId, done: bool },
 }
 
 impl IterValue {
