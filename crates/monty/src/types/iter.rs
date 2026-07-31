@@ -29,7 +29,7 @@ use crate::{
     heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::{BytesId, Interns},
     resource::ResourceTracker,
-    types::{List, PyTrait, Range, dict_view::DictView, str::allocate_char},
+    types::{PyTrait, Range, dict_view::DictView, str::allocate_char},
     value::Value,
 };
 
@@ -46,7 +46,7 @@ use crate::{
 /// [`MontyIter::value`] is the single edge `collect_child_ids` follows for `HeapData::Iter` - so it
 /// holds whatever the variant needs traced rather than the iterable: `Value::None` for the variants
 /// that copy their state out (`Range`, `IterStr`, released in [`MontyIter::new`]), the iterated
-/// container for `HeapRef`, and the `[callable, sentinel]` pair list for `CallableSentinel`, whose
+/// container for `HeapRef`, and the `(callable, sentinel)` pair tuple for `CallableSentinel`, whose
 /// ownership model is documented on that variant.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MontyIter {
@@ -147,83 +147,66 @@ impl MontyIter {
         }
     }
 
-    /// Allocates the `[callable, sentinel]` pair backing a callable-driven iterator.
+    /// Allocates the `(callable, sentinel)` pair tuple backing a callable-driven iterator.
     ///
     /// Takes ownership of both values and returns the single owning reference to the pair, which
     /// the caller hands straight to [`MontyIter::allocate_callable_sentinel`]. The pair exists so
     /// that one `MontyIter::value` edge reaches two owned values; see
     /// `IterValue::CallableSentinel` for that design.
     ///
-    /// # Foot-guns
+    /// A two-element `HeapData::Tuple` is the backing container by design, not by convenience.
+    /// `collect_child_ids` already walks a tuple element-wise, gated on `Tuple::contains_refs`,
+    /// which is the property that makes both owned values reachable from the mark phase without
+    /// touching `heap.rs`. `Tuple::new` derives that flag from the values themselves and
+    /// `Heap::allocate` raises the cycle metadata from it, so the pair needs no manual
+    /// reference bookkeeping at all. A tuple is also immutable and unreachable from Python, so
+    /// nothing can reshape the pair behind the iterator's back, and it is the representation an
+    /// existing snapshot decodes into - the variant is serialized with the rest of the heap, so the
+    /// backing type is a wire contract, not an implementation detail.
     ///
-    /// - **Why a `List` and not a `Tuple`.** `Heap::allocate` enforces the resource limits
-    ///   *before* inserting the entry and takes its `HeapData` **by value**, so a rejected
-    ///   allocation destroys that `HeapData` with ordinary Rust destruction - which has no heap
-    ///   access. Handing `[callable, sentinel]` over up front would therefore leak both values'
-    ///   reference counts, or panic in `Value::drop` under `ref-count-panic`, whenever an
-    ///   allocation limit rejects the pair, and no caller-side guard could repair it because
-    ///   ownership is already inside `allocate`. The fix is to allocate the container
-    ///   **reference-free** and move the values in afterwards, and `List` is the only container
-    ///   that permits it: `Tuple::new` and its `items` field are private to `types::tuple`, and
-    ///   an already-allocated entry's `HeapData` cannot be replaced. The pair is never exposed to
-    ///   Python, so its mutability is unobservable.
-    /// - Nothing fallible may sit between `allocate` succeeding and the move-in. Across that gap
-    ///   the two `Value::None` placeholders own nothing while `callable` and `sentinel` are still
-    ///   held in locals, so an early return would strand the freshly allocated entry. The move-in
-    ///   goes through the **infallible** `HeapRead::get_mut`, which is what closes the gap.
-    /// - `List::as_vec_mut` deliberately does not maintain the `contains_refs` flag, and
-    ///   `collect_child_ids` **skips** a list whose flag is clear. Forgetting
-    ///   `List::set_contains_refs` here would hide a heap-valued callable or sentinel from the mark
-    ///   phase and let a collection free it while the iterator still points at it.
-    /// - `Heap::mark_potential_cycle` re-establishes the cycle metadata `Heap::allocate`
-    ///   maintains for reference-holding data, which the reference-free list never raised.
-    ///   `Heap::should_gc` gates *all* collection on that flag, so keep the mutation and the
-    ///   metadata in step. Both markers are set unconditionally, which over-approximates for a pair
-    ///   of immediates such as `iter(int, 1)` - the safe direction, and the reason neither is
-    ///   conditional on the values' kinds.
+    /// # Foot-gun: a rejected allocation has already consumed both values
+    ///
+    /// `Heap::allocate` enforces the resource limits *before* inserting the entry and takes its
+    /// `HeapData` **by value**, so a rejection destroys the tuple - and with it both `Value`s -
+    /// through ordinary Rust destruction, which has no heap access and therefore decrements
+    /// nothing. By then ownership is inside `allocate` and the two reference counts can no longer
+    /// be reached through the values. Both `HeapId`s are captured **before** the move for exactly
+    /// that reason, and the rejection path releases them from the captured ids instead.
+    ///
+    /// Under `--features ref-count-panic` that release is unreachable, because the rejected
+    /// `HeapData`'s own destruction panics in `Value::drop` before `allocate` returns. That is
+    /// inherited from `Heap::allocate` and behaves identically at every allocate-with-owned-values
+    /// site in the crate - the `BuildList`/`BuildDict`/`BuildSet` opcodes, `sorted`, `map`,
+    /// `filter`, `zip`, `list()`, `set()`, `allocate_tuple` itself and the `DictItemsView` arm in
+    /// this very file, all of which propagate with a bare `?` and clean up nothing. Removing it for
+    /// good belongs in `Heap::allocate` or `types::tuple`; both are outside this feature's scope, so
+    /// the id capture buys back the default and `ref-count-return` configurations and no more.
     fn allocate_callable_sentinel_pair(
         callable: Value,
         sentinel: Value,
         vm: &mut VM<'_, '_, impl ResourceTracker>,
     ) -> RunResult<Value> {
-        // Reference-free, so a rejected allocation destroys nothing that owns a heap reference and
-        // `callable`/`sentinel` are still ours to release below.
-        let placeholders = List::new(vec![Value::None, Value::None]);
-        let pair = match vm.heap.allocate(HeapData::List(placeholders)) {
-            Ok(pair) => pair,
+        // Captured before the values move into the tuple: after the move the only handle on their
+        // reference counts is the id, because a rejected allocation destroys the values themselves
+        // without heap access. See the foot-gun above.
+        let callable_id = callable.ref_id();
+        let sentinel_id = sentinel.ref_id();
+
+        // Both values move in with no clone, and `Tuple::new` derives `contains_refs` from them, so
+        // the mark phase can traverse the pair and `Heap::allocate` raises the cycle metadata.
+        match super::allocate_tuple(smallvec::smallvec![callable, sentinel], vm.heap) {
+            Ok(pair_value) => Ok(pair_value),
             Err(err) => {
-                // Single linear path with no branching, so direct drops are appropriate here.
-                callable.drop_with_heap(vm);
-                sentinel.drop_with_heap(vm);
-                return Err(err.into());
+                // Released from the ids rather than the values, which the rejected tuple consumed.
+                if let Some(id) = callable_id {
+                    vm.heap.dec_ref(id);
+                }
+                if let Some(id) = sentinel_id {
+                    vm.heap.dec_ref(id);
+                }
+                Err(err.into())
             }
-        };
-
-        // Infallible move-in. The entry was created immediately above, so it exists and its variant
-        // is known.
-        let HeapReadOutput::List(mut entry) = vm.heap.read(pair) else {
-            panic!("iter(callable, sentinel): a freshly allocated list must read back as HeapData::List")
-        };
-        let list = entry.get_mut(vm.heap);
-        let items = list.as_vec_mut();
-        // Overwrites `Value::None`, which owns nothing, so neither assignment can drop a reference;
-        // ownership of both values transfers into the pair here.
-        items[0] = callable;
-        items[1] = sentinel;
-        // `as_vec_mut` does not track this, and `collect_child_ids` skips a list without it.
-        list.set_contains_refs();
-        // Release the reader count before the pair reference is handed on, so the caller sees an
-        // entry with no outstanding readers.
-        drop(entry);
-        // This entry may now hold heap references even though it was allocated without any, so
-        // re-establish the cycle metadata `Heap::allocate` maintains for reference-holding data.
-        // Both this and `set_contains_refs` above are set unconditionally and are therefore
-        // conservative: `iter(int, 1)` stores two immediates and owns nothing outgoing, but
-        // over-approximating only costs the mark phase a visit, whereas under-approximating would
-        // hide a heap-valued callable or sentinel from it.
-        vm.heap.mark_potential_cycle();
-
-        Ok(Value::Ref(pair))
+        }
     }
 
     /// Allocates the heap entry for a callable-driven `iter(callable, sentinel)` iterator.
@@ -239,21 +222,26 @@ impl MontyIter {
     /// # Foot-guns
     ///
     /// - The entry is allocated holding `Value::None` and the pair reference is moved in
-    ///   **afterwards**, for the same reason the pair itself is filled after allocation:
-    ///   `Heap::allocate` takes its `HeapData` by value and destroys a rejected one with ordinary
-    ///   Rust destruction, which has no heap access. Handing the pair over up front would leak the
-    ///   whole pair sub-graph - or panic in `Value::drop` under `ref-count-panic` - whenever a
-    ///   resource limit rejects the iterator, and no call-site guard could repair that once
-    ///   ownership is inside `allocate`.
+    ///   **afterwards**, so that a rejected allocation cannot consume the pair. `Heap::allocate`
+    ///   takes its `HeapData` by value and destroys a rejected one with ordinary Rust destruction,
+    ///   which has no heap access, so handing the pair over up front would leak the whole pair
+    ///   sub-graph - or panic in `Value::drop` under `ref-count-panic` - whenever a resource limit
+    ///   rejects the iterator, and no call-site guard could repair that once ownership is inside
+    ///   `allocate`. This allocate-then-fill shape is available here only because `MontyIter`'s
+    ///   fields are private to *this* module; the pair cannot use it, because `Tuple::new` and its
+    ///   `items` field are private to `types::tuple`, which is why
+    ///   [`MontyIter::allocate_callable_sentinel_pair`] recovers from a rejection by id instead.
     /// - Nothing fallible may be inserted between `allocate` succeeding and the move-in. Across that
     ///   gap `pair_value` is the pair's *only* owner - the new iterator still holds `Value::None` -
     ///   while nothing owns the new iterator entry, so an early return would strand both. The
     ///   move-in goes through the **infallible** `HeapRead::get_mut`, which is what closes the gap.
     /// - `Heap::mark_potential_cycle` re-establishes the cycle metadata `Heap::allocate` maintains
-    ///   for reference-holding data, which the reference-free iterator never raised. It is
-    ///   **conservative** rather than load-bearing here - the pair allocation already raised the
-    ///   flag for the same sub-graph - but `Heap::should_gc` gates *all* collection on that flag, so
-    ///   keep the mutation and the metadata in step.
+    ///   for reference-holding data, which the reference-free iterator never raised. The pair
+    ///   allocation raises the flag by itself whenever the callable or the sentinel is a heap value,
+    ///   but *not* for a pair of immediates such as `iter(int, 1)`, whose tuple owns nothing
+    ///   outgoing - and the iterator ends up holding a reference to the pair either way. This call
+    ///   is what covers that case. `Heap::should_gc` gates *all* collection on the flag, so keep the
+    ///   mutation and the metadata in step.
     fn allocate_callable_sentinel(pair_value: Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
         let Some(pair) = pair_value.ref_id() else {
             panic!("iter(callable, sentinel): the pair must be a heap reference")
@@ -766,8 +754,8 @@ fn get_heap_item(
 ///   from a root: `next(iter(f, s))` owns it only through the argument list that was popped before
 ///   the builtin ran, and `dict_view::collect_iterable_to_set` holds it in a `HeapGuard`. Protecting
 ///   the entry transitively protects everything the iterator owns, because `collect_child_ids`
-///   follows `HeapData::Iter` -> `MontyIter::value` -> the `HeapData::List` pair -> the callable and
-///   the sentinel, so the `clone_with_heap` copies taken below need nothing of their own.
+///   follows `HeapData::Iter` -> `MontyIter::value` -> the `HeapData::Tuple` pair -> the callable
+///   and the sentinel, so the `clone_with_heap` copies taken below need nothing of their own.
 /// * The **`next()` default**, which `iterator_next` holds in a `HeapGuard` across the advance -
 ///   `next(iter(f, s), ['FALLBACK'])` builds exactly such a value.
 /// * Whatever the **enclosing runtime-Rust frame** is accumulating. The temporary `Set` that
@@ -850,28 +838,28 @@ fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapI
     })
 }
 
-/// Reads the `[callable, sentinel]` pair backing a callable-driven iterator.
+/// Reads the `(callable, sentinel)` pair tuple backing a callable-driven iterator.
 ///
 /// Returns owned clones of both values, reference counted via `clone_with_heap` so the caller can
 /// use them after the heap borrow ends. Takes `&VM` immutably and deliberately does **not** open
-/// a `HeapRead<List>`, so no reader count is taken on the pair and no `dec_ref` panic can
+/// a `HeapRead<Tuple>`, so no reader count is taken on the pair and no `dec_ref` panic can
 /// originate here.
 ///
 /// # Panics
 ///
-/// Panics if `pair` is not a two-element list. That is a programmer error rather than a runtime
+/// Panics if `pair` is not a two-element tuple. That is a programmer error rather than a runtime
 /// condition: `MontyIter::allocate_callable_sentinel_pair` is the only producer of the pair and it
-/// always allocates exactly `[callable, sentinel]`, and nothing afterwards can change that shape.
-/// The pair is never exposed to Python and no public path can mutate it - the only owning reference
-/// lives in `MontyIter::value` - while the two accesses that do exist internally are both read-only
-/// and shape-preserving: this per-step read through the `pair` id mirrored in
-/// `IterValue::CallableSentinel`, and the shared reference `MontyIter::value` hands to
-/// `collect_child_ids` for garbage-collection traversal.
+/// always allocates exactly `(callable, sentinel)`, and nothing afterwards can change that shape -
+/// a tuple is immutable, so unlike a mutable container it cannot even be reshaped in principle. The
+/// pair is never exposed to Python and the only owning reference lives in `MontyIter::value`, while
+/// the two accesses that do exist internally are both read-only: this per-step read through the
+/// `pair` id mirrored in `IterValue::CallableSentinel`, and the shared reference `MontyIter::value`
+/// hands to `collect_child_ids` for garbage-collection traversal.
 fn callable_sentinel_pair(vm: &VM<'_, '_, impl ResourceTracker>, pair: HeapId) -> (Value, Value) {
-    let HeapData::List(list) = vm.heap.get(pair) else {
-        panic!("callable_sentinel_pair: expected the iter(callable, sentinel) pair list")
+    let HeapData::Tuple(tuple) = vm.heap.get(pair) else {
+        panic!("callable_sentinel_pair: expected the iter(callable, sentinel) pair tuple")
     };
-    let [callable, sentinel] = list.as_slice() else {
+    let [callable, sentinel] = tuple.as_slice() else {
         panic!("callable_sentinel_pair: the iter(callable, sentinel) pair must hold exactly two items")
     };
     (callable.clone_with_heap(vm), sentinel.clone_with_heap(vm))
@@ -994,14 +982,15 @@ enum IterValue {
     /// - `pair` is a **non-owning mirror** of the `HeapId` already owned by `MontyIter::value`,
     ///   exactly as `HeapRef::heap_id` mirrors it, so it is *not* separately reference counted and
     ///   must never be dropped, cloned into a `Value`, or outlive `MontyIter::value`. It points at
-    ///   a two-element list `[callable, sentinel]`. That indirection is the whole design: this
+    ///   a two-element tuple `(callable, sentinel)`. That indirection is the whole design: this
     ///   iterator owns two values while `collect_child_ids` traces only `MontyIter::value`, so
     ///   routing both through one container lets the collector reach them through the pre-existing
-    ///   `HeapData::Iter` -> `HeapData::List` arms - keeping mark-and-sweep sound with no change
+    ///   `HeapData::Iter` -> `HeapData::Tuple` arms - keeping mark-and-sweep sound with no change
     ///   to `heap.rs` and none to the lifecycle methods, which all route through `value` alone. It
-    ///   is also why no `Value` is held inline despite the `Clone` derive. The container is a
-    ///   `List` rather than a `Tuple` so it can be allocated reference-free and filled afterwards;
-    ///   `MontyIter::allocate_callable_sentinel_pair` documents why that matters.
+    ///   is also why no `Value` is held inline despite the `Clone` derive. A tuple is the right
+    ///   container because it is immutable and reference-traced element-wise, so the pair's shape is
+    ///   guaranteed for the iterator's whole life; `MontyIter::allocate_callable_sentinel_pair`
+    ///   documents the ownership consequence at construction.
     /// - `done` is **sticky** and is set **only** when a produced value compares equal to the
     ///   sentinel. An exception escaping the callable must leave it `false` so the iterator stays
     ///   live, matching CPython, where the next `next()` after a propagated error succeeds. Once
