@@ -204,6 +204,64 @@ for value in iter(lambda: recovered.pop(0), ''):
 assert result == ['ok', 'go'], 'iteration still works after the abandoned callable was cleaned up'
 assert recovered == [], 'the recovery drive consumed the whole queue including its sentinel'
 
+# The same abandoned callable driven by next(), which reaches the iterator through a
+# builtin call rather than through the for loop. Every drive path has to report the
+# failure to the handler that surrounds it, so this case is not a duplicate of the one
+# above: it is the only one that covers the next() route out of a mid-flight callable.
+next_handler_calls = [0]
+
+
+def invalid_handler_then_value():
+    next_handler_calls[0] = next_handler_calls[0] + 1
+    if next_handler_calls[0] == 1:
+        try:
+            raise ValueError('inner')
+        except 123:
+            return 0
+    return next_handler_calls[0]
+
+
+it = iter(invalid_handler_then_value, 0)
+try:
+    next(it)
+    assert False, 'expected the invalid except clause to raise TypeError through next()'
+except TypeError as exc:
+    assert str(exc) == 'catching classes that do not inherit from BaseException is not allowed', (
+        'a next() driven invalid except clause reports its own TypeError to the caller'
+    )
+assert next(it) == 2, 'the iterator is still usable after the abandoned callable'
+assert next_handler_calls[0] == 2, 'the failed step and the following one account for both calls'
+
+# And driven by a dict-view set operator, the third way an iterator object is advanced:
+# it is neither a for loop nor next(), so it is the remaining route that has to surface
+# the failure to the surrounding handler.
+view_handler_calls = [0]
+
+
+def invalid_handler_view():
+    view_handler_calls[0] = view_handler_calls[0] + 1
+    try:
+        raise ValueError('inner')
+    except 123:
+        return 'x'
+
+
+try:
+    {'a': 1}.keys() | iter(invalid_handler_view, 0)
+    assert False, 'expected the invalid except clause to raise TypeError through the dict view'
+except TypeError as exc:
+    assert str(exc) == 'catching classes that do not inherit from BaseException is not allowed', (
+        'a dict-view driven invalid except clause reports its own TypeError to the caller'
+    )
+assert view_handler_calls[0] == 1, 'the callable was invoked exactly once before it failed'
+
+# the same operator, now with a callable that behaves, proving nothing about the
+# abandoned one was left behind on this route either
+view_queue = ['b', 'c', '']
+union = {'a': 1}.keys() | iter(lambda: view_queue.pop(0), '')
+assert sorted(union) == ['a', 'b', 'c'], 'a dict-view set operator consumes a sentinel iterator'
+assert view_queue == [], 'the union drive consumed the whole queue including its sentinel'
+
 # === Argument-count errors ===
 # iter takes one or two positional-only arguments; both bounds keep their
 # CPython messages.

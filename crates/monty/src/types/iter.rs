@@ -542,6 +542,11 @@ impl<'h> HeapRead<'h, MontyIter> {
     /// - `done` is written **only** on the `Ok(None)` path, which the step reports for sentinel
     ///   equality alone. Every propagated error leaves via `?` before any window after the step is
     ///   opened, so a raised exception keeps the iterator usable.
+    /// - The VM's frame state is not this function's concern, and must not become it:
+    ///   `callable_sentinel_step` restores the caller's frame depth and instruction pointer before it
+    ///   returns, so an error propagated from here reaches the exception handling of whichever
+    ///   operation drove the advance. Doing it there instead of here is what keeps a callable's
+    ///   exception catchable on *every* drive path rather than only the one this method serves.
     fn advance_callable_sentinel(&mut self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
         // Window 1: copy the state out, then let the borrow on `vm.heap` end immediately.
         let (pair, done) = match &self.get(vm.heap).iter_value {
@@ -710,6 +715,18 @@ fn get_heap_item(
 /// sentinel. The guard sits here, the single choke point every consumer funnels through, rather than
 /// being repeated at each call site.
 ///
+/// # Why the step restores frame state
+///
+/// Re-entering the VM can also return with the callable's frames still registered - an error that
+/// leaves the nested `run()` loop without going through `catch_sync!` skips the unwinding that would
+/// have popped them - and with `instruction_ip` pointing inside the callable. Both leave the *caller*
+/// looking for its `except` clause in a frame that no longer runs, so a perfectly catchable exception
+/// escapes uncaught, breaking the transparency this form promises. [`VM::with_frame_state_restored`]
+/// carries the details; the guard belongs **here** rather than in a consumer because an advance is
+/// driven from three places - `Opcode::ForIter`, the `next()` builtin through [`iterator_next`], and
+/// dict-view set operators through `collect_iterable_to_set` - and only this choke point covers all
+/// of them, including any consumer added later.
+///
 /// # Foot-guns
 ///
 /// - **No heap borrow may be live when this is called.** It re-enters the VM via
@@ -745,25 +762,31 @@ fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapI
     // Suspended across the nested call and the comparison below, which is where a collection can
     // occur while these values are held only in Rust locals. See the section above.
     vm.with_gc_paused(|vm| {
-        // Guard the owned clones as one unit so every exit path - including `?` from the call and
-        // from the comparison - releases both. Manual drops would leak here: there are four
-        // distinct exits between acquiring these values and releasing them.
-        let mut owned_guard = HeapGuard::new(callable_sentinel_pair(vm, pair), vm);
-        let ((callable, sentinel), vm) = owned_guard.as_parts();
+        // Wrapped so the frame depth and instruction pointer the caller had are back in place before
+        // anything - value or error - leaves this function, whichever consumer drove the advance.
+        // Inside the collection suspension so the value handed out through this boundary is still
+        // covered by it. See the section above.
+        vm.with_frame_state_restored(|vm| {
+            // Guard the owned clones as one unit so every exit path - including `?` from the call and
+            // from the comparison - releases both. Manual drops would leak here: there are four
+            // distinct exits between acquiring these values and releasing them.
+            let mut owned_guard = HeapGuard::new(callable_sentinel_pair(vm, pair), vm);
+            let ((callable, sentinel), vm) = owned_guard.as_parts();
 
-        // Propagated with `?` and nothing more: whatever the callable raises reaches the caller
-        // unchanged in type and message, so no error can be mistaken for exhaustion.
-        let produced = vm.evaluate_function("iter(callable, sentinel)", callable, ArgValues::Empty)?;
+            // Propagated with `?` and nothing more: whatever the callable raises reaches the caller
+            // unchanged in type and message, so no error can be mistaken for exhaustion.
+            let produced = vm.evaluate_function("iter(callable, sentinel)", callable, ArgValues::Empty)?;
 
-        // The produced value needs its own guard because its fate is conditional: released when it
-        // equals the sentinel, handed back to the caller otherwise, and released if the comparison
-        // itself fails. Declared after `owned_guard` so it is dropped first.
-        let mut produced_guard = HeapGuard::new(produced, vm);
-        let (produced, vm) = produced_guard.as_parts();
-        if produced.py_eq(sentinel, vm)? {
-            return Ok(None);
-        }
-        Ok(Some(produced_guard.into_inner()))
+            // The produced value needs its own guard because its fate is conditional: released when it
+            // equals the sentinel, handed back to the caller otherwise, and released if the comparison
+            // itself fails. Declared after `owned_guard` so it is dropped first.
+            let mut produced_guard = HeapGuard::new(produced, vm);
+            let (produced, vm) = produced_guard.as_parts();
+            if produced.py_eq(sentinel, vm)? {
+                return Ok(None);
+            }
+            Ok(Some(produced_guard.into_inner()))
+        })
     })
 }
 
@@ -812,6 +835,10 @@ fn callable_sentinel_pair(vm: &VM<'_, '_, impl ResourceTracker>, pair: HeapId) -
 /// callable-driven iterator re-enters the interpreter and so can reach a collection point.
 /// `callable_sentinel_step` suspends collection for exactly this reason, so nothing here may be
 /// restructured to hold a heap value across an advance outside that suspension.
+///
+/// That same re-entry is why the error propagated by the `?` below is catchable at all: the step
+/// restores the caller's frame depth and instruction pointer first, so the `try`/`except` containing
+/// this `next()` call is what the exception lookup sees rather than an abandoned callable frame.
 pub fn iterator_next(
     iter_value: &Value,
     default: Option<Value>,
