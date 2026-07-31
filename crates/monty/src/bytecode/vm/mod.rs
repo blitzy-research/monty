@@ -1261,7 +1261,20 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     // `CallFunction` and `CallBuiltinFunction` below do, so this instruction stays
                     // resumable from the frame a nested unwind or `pop_frame` restore observes.
                     self.current_frame_mut().ip = cached_frame.ip;
+                    // Recorded because both cleanup arms below pop the iterator *by position*: see
+                    // `discard_frames_above`, which is what makes that assumption hold again after the
+                    // advance re-entered the interpreter.
+                    let frame_depth = self.frames.len();
                     let advanced = iter.advance(self);
+                    // Drop the HeapRead before any dec_ref to release the reader count. No arm below
+                    // needs it, and the frame cleanup that follows already releases heap values.
+                    drop(iter);
+                    // An error raised at an instruction boundary of the nested loop leaves by `?`
+                    // without unwinding, so the callee frames can still be registered here with their
+                    // locals and operands stacked above the iterator. Restoring the depth puts the
+                    // iterator back on top for the pops below and leaves `handle_exception` looking at
+                    // the frame that actually executed this instruction. A no-op on every other path.
+                    self.discard_frames_above(frame_depth);
                     // A nested run loop resets `instruction_ip` when its frame is popped, so restore it
                     // here - between the advance and the `match`, which is why the result is bound to a
                     // local first. `catch_sync!` in the error arm reads `instruction_ip`, while
@@ -1272,16 +1285,12 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     match advanced {
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
-                            // Drop the HeapRead before dec_ref to release the reader count
-                            drop(iter);
                             // Iterator exhausted - pop it and jump to end
                             let iter = self.pop();
                             iter.drop_with_heap(self);
                             jump_relative!(cached_frame.ip, offset);
                         }
                         Err(e) => {
-                            // Drop the HeapRead before dec_ref to release the reader count
-                            drop(iter);
                             // Error during iteration (e.g., dict size changed)
                             let iter = self.pop();
                             iter.drop_with_heap(self);
@@ -1719,6 +1728,34 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             self.heap.decr_recursion_depth();
         }
         frame.should_return
+    }
+
+    /// Discards every frame above `depth`, releasing each frame's stack region as it goes.
+    ///
+    /// A nested `run()` loop normally unwinds itself: an exception is routed through
+    /// `handle_exception`, which pops frames until it reaches the `should_return` boundary
+    /// [`VM::evaluate_function`] marked, so the depth is already restored when the `Err` surfaces.
+    /// The exceptions are the errors raised at an *instruction boundary* - `Heap::check_time` at the
+    /// top of the loop, and a handful of allocation checks inside opcode arms - which leave by `?`
+    /// without unwinding anything. Those hand back an `Err` with the callee frames still registered
+    /// and their locals and operands still stacked above the caller's.
+    ///
+    /// Any caller whose own cleanup addresses the operand stack *by position* after re-entering the
+    /// interpreter must therefore restore the depth first. `Opcode::ForIter` is the only such site:
+    /// advancing a callable-driven `iter(callable, sentinel)` iterator re-enters the VM, and the arm
+    /// then pops the iterator it left on the stack. This mirrors how `evaluate_function` abandons the
+    /// frames of an evaluation it could not complete.
+    ///
+    /// # Foot-gun
+    ///
+    /// The abandoned frames contribute no traceback entries, exactly as in `evaluate_function`'s own
+    /// cleanup - `unwind_for_traceback` is what attributes frames, and it never sees them. The error
+    /// therefore reports the position of the instruction that re-entered the interpreter, not the
+    /// position inside the callable.
+    fn discard_frames_above(&mut self, depth: usize) {
+        while self.frames.len() > depth {
+            self.pop_frame();
+        }
     }
 
     fn cleanup_frame_state(&mut self, frame: &CallFrame<'_>) {

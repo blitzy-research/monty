@@ -120,6 +120,108 @@ except ValueError as exc:
     assert str(exc) == 'kaboom', 'the exception propagates unchanged through the for loop'
 assert result == [], 'nothing was yielded before the callable raised'
 
+# === StopIteration from the callable signals exhaustion ===
+# StopIteration is the one exception the sentinel form does not propagate: it is
+# a second way of saying "no more values", so iteration ends instead of the
+# program aborting. Exhaustion is just as sticky as it is for the sentinel, and
+# any message the callable attached is dropped because the StopIteration a later
+# next() raises is a fresh one.
+stop_raiser_calls = [0]
+
+
+def stop_raiser():
+    stop_raiser_calls[0] = stop_raiser_calls[0] + 1
+    raise StopIteration
+
+
+it = iter(stop_raiser, 0)
+try:
+    next(it)
+    assert False, 'expected a StopIteration from the callable to end iteration'
+except StopIteration as exc:
+    assert str(exc) == '', 'StopIteration from the callable carries no message'
+assert stop_raiser_calls[0] == 1, 'the callable was invoked exactly once'
+try:
+    next(it)
+    assert False, 'expected the second next() to raise StopIteration again'
+except StopIteration as exc:
+    assert str(exc) == '', 'the repeated StopIteration also carries no message'
+assert stop_raiser_calls[0] == 1, 'exhaustion is sticky, so the callable is not re-invoked'
+assert next(it, 'DEF') == 'DEF', 'next(it, default) returns the default after a callable StopIteration'
+assert stop_raiser_calls[0] == 1, 'next(it, default) must not re-invoke the callable'
+
+# a message on the raised StopIteration is discarded, not reported
+msg_calls = [0]
+
+
+def stop_with_message():
+    msg_calls[0] = msg_calls[0] + 1
+    raise StopIteration('custom')
+
+
+try:
+    next(iter(stop_with_message, 0))
+    assert False, 'expected StopIteration to end iteration'
+except StopIteration as exc:
+    assert str(exc) == '', 'the message on the raised StopIteration is dropped'
+assert msg_calls[0] == 1, 'the message-carrying callable was invoked exactly once'
+
+
+# a for loop over a callable that raises immediately ends normally
+def stop_first_call():
+    return next(iter([]))
+
+
+result = []
+for value in iter(stop_first_call, 0):
+    result.append(value)
+assert result == [], 'a for loop ends normally when the callable raises StopIteration'
+
+# values yielded before the StopIteration are kept
+partial_calls = [0]
+
+
+def stop_at_third():
+    partial_calls[0] = partial_calls[0] + 1
+    if partial_calls[0] == 3:
+        raise StopIteration
+    return partial_calls[0]
+
+
+result = []
+for value in iter(stop_at_third, 99):
+    result.append(value)
+assert result == [1, 2], 'the values produced before the StopIteration are yielded'
+assert partial_calls[0] == 3, 'two yields plus the call that signalled exhaustion'
+
+# the comprehension drive path behaves identically
+comp_stop_calls = [0]
+
+
+def stop_at_second():
+    comp_stop_calls[0] = comp_stop_calls[0] + 1
+    if comp_stop_calls[0] == 2:
+        raise StopIteration
+    return comp_stop_calls[0]
+
+
+assert [v for v in iter(stop_at_second, 99)] == [1], 'a comprehension ends on a callable StopIteration'
+assert comp_stop_calls[0] == 2, 'one yield plus the call that signalled exhaustion'
+
+# the canonical wrapper idiom: drive an inner iterator through next()
+source = iter([1, 2, 3])
+
+
+def pull():
+    return next(source)
+
+
+result = []
+for value in iter(pull, None):
+    result.append(value)
+assert result == [1, 2, 3], 'iter(callable, sentinel) can wrap an inner iterator driven by next()'
+
+
 # === Argument-count errors ===
 # iter takes one or two positional-only arguments; both bounds keep their
 # CPython messages.
