@@ -173,12 +173,14 @@ impl MontyIter {
     ///   goes through the **infallible** `HeapRead::get_mut`, which is what closes the gap.
     /// - `List::as_vec_mut` deliberately does not maintain the `contains_refs` flag, and
     ///   `collect_child_ids` **skips** a list whose flag is clear. Forgetting
-    ///   `List::set_contains_refs` here would hide the callable and the sentinel from the mark
-    ///   phase and let a collection free them while the iterator still points at them.
+    ///   `List::set_contains_refs` here would hide a heap-valued callable or sentinel from the mark
+    ///   phase and let a collection free it while the iterator still points at it.
     /// - `Heap::mark_potential_cycle` re-establishes the cycle metadata `Heap::allocate`
     ///   maintains for reference-holding data, which the reference-free list never raised.
     ///   `Heap::should_gc` gates *all* collection on that flag, so keep the mutation and the
-    ///   metadata in step.
+    ///   metadata in step. Both markers are set unconditionally, which over-approximates for a pair
+    ///   of immediates such as `iter(int, 1)` - the safe direction, and the reason neither is
+    ///   conditional on the values' kinds.
     fn allocate_callable_sentinel_pair(
         callable: Value,
         sentinel: Value,
@@ -213,8 +215,12 @@ impl MontyIter {
         // Release the reader count before the pair reference is handed on, so the caller sees an
         // entry with no outstanding readers.
         drop(entry);
-        // This entry now holds references even though it was allocated without any, so re-establish
-        // the cycle metadata `Heap::allocate` maintains for reference-holding data.
+        // This entry may now hold heap references even though it was allocated without any, so
+        // re-establish the cycle metadata `Heap::allocate` maintains for reference-holding data.
+        // Both this and `set_contains_refs` above are set unconditionally and are therefore
+        // conservative: `iter(int, 1)` stores two immediates and owns nothing outgoing, but
+        // over-approximating only costs the mark phase a visit, whereas under-approximating would
+        // hide a heap-valued callable or sentinel from it.
         vm.heap.mark_potential_cycle();
 
         Ok(Value::Ref(pair))
@@ -421,7 +427,7 @@ impl MontyIter {
                 // `MontyIter::new` - the only route into a bare `MontyIter` - can never build one.
                 // It is implemented correctly rather than left as `unreachable!()` so the two
                 // advance paths cannot silently diverge if that ever changes; `HeapRead::advance`
-                // is the path Python code actually takes, and it is the one the tests exercise.
+                // is the path Python code actually takes.
                 // Unlike there, `self` and `vm` are disjoint parameters, so `vm` can be handed to
                 // the nested call directly with no borrow window to juggle. `size_hint` carries the
                 // same classification for the same reason.
@@ -803,16 +809,20 @@ fn get_heap_item(
 fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapId) -> RunResult<Option<Value>> {
     // Enforce the time limit before every invocation, for the same reason `MontyIter::for_next`
     // opens with the same check: a Rust-side drive loop must not be able to run forever inside a
-    // single bytecode instruction. This is the only place that can guarantee it for a
-    // callable-driven iterator, because it is the single choke point every consumer funnels
-    // through - `MontyIter::for_next`, and `HeapRead::advance` for `Opcode::ForIter`, the `next()`
-    // builtin and `dict_view::collect_iterable_to_set`. The per-instruction check in `VM::run`
-    // covers none of them: `dict_view::collect_iterable_to_set` drives `advance` from a pure-Rust
-    // `while let` loop, and a *direct* callable such as a builtin type returns a value without ever
-    // entering `VM::run`, so `{}.keys() | iter(int, 1)` would otherwise spin forever with a
-    // duration limit configured. Placed before the guard below so a rejection unwinds with nothing
-    // acquired, and left outside it because the limit must still be enforced while collection is
-    // suspended - `check_time` is a `ResourceTracker` concern, wholly independent of the collector.
+    // single bytecode instruction. `VM::run` does check the time before *every* opcode, so an
+    // advance that is itself one instruction is already covered at that boundary: both
+    // `Opcode::ForIter` and the instruction that calls the `next()` builtin are. What no instruction
+    // boundary can cover is **repeated** advances inside a single operation -
+    // `dict_view::collect_iterable_to_set` drives `advance` from a pure-Rust `while let` loop, and a
+    // *direct* callable such as a builtin type returns a value without entering `VM::run` at all, so
+    // `{}.keys() | iter(int, 1)` would spin forever with a duration limit configured. Checking here
+    // therefore gives every consumer a per-step choke point rather than a per-instruction one, and
+    // here is where it belongs because this is the single point they all funnel through -
+    // `MontyIter::for_next`, and `HeapRead::advance` for `Opcode::ForIter`, the `next()` builtin and
+    // `dict_view::collect_iterable_to_set`. Placed before the guard below so a rejection unwinds
+    // with nothing acquired, and left outside it because the limit must still be enforced while
+    // collection is suspended - `check_time` is a `ResourceTracker` concern, wholly independent of
+    // the collector.
     vm.heap.check_time()?;
 
     // Suspended for the whole step rather than only around the nested call, because the second
@@ -851,9 +861,12 @@ fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapI
 ///
 /// Panics if `pair` is not a two-element list. That is a programmer error rather than a runtime
 /// condition: `MontyIter::allocate_callable_sentinel_pair` is the only producer of the pair and it
-/// always allocates exactly `[callable, sentinel]`, which nothing else can reach because the pair
-/// is never exposed to Python - the only reference to it lives in `MontyIter::value`, and
-/// `MontyIter` never hands that value out.
+/// always allocates exactly `[callable, sentinel]`, and nothing afterwards can change that shape.
+/// The pair is never exposed to Python and no public path can mutate it - the only owning reference
+/// lives in `MontyIter::value` - while the two accesses that do exist internally are both read-only
+/// and shape-preserving: this per-step read through the `pair` id mirrored in
+/// `IterValue::CallableSentinel`, and the shared reference `MontyIter::value` hands to
+/// `collect_child_ids` for garbage-collection traversal.
 fn callable_sentinel_pair(vm: &VM<'_, '_, impl ResourceTracker>, pair: HeapId) -> (Value, Value) {
     let HeapData::List(list) = vm.heap.get(pair) else {
         panic!("callable_sentinel_pair: expected the iter(callable, sentinel) pair list")
