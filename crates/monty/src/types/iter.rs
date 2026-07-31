@@ -25,7 +25,7 @@ use std::mem;
 use crate::{
     args::ArgValues,
     bytecode::VM,
-    exception_private::{ExcType, RunError, RunResult},
+    exception_private::{ExcType, RunResult},
     heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::{BytesId, Interns},
     resource::ResourceTracker,
@@ -71,8 +71,8 @@ impl MontyIter {
     ///   otherwise the value is yielded. The stop test is `==` rich value comparison
     ///   ([`Value::py_eq`]), never identity, so `3.0` stops against an integer sentinel `3`
     ///   and a `[]` sentinel stops against a freshly built empty list. The result is
-    ///   self-iterable and exceptions raised by `callable` propagate unchanged - except
-    ///   `StopIteration`, which CPython treats as a second way of signalling exhaustion; see
+    ///   self-iterable, and every exception raised by `callable` propagates unchanged in type
+    ///   and message, because sentinel equality is the sole stop condition; see
     ///   `callable_sentinel_step`.
     ///
     /// `iter` accepts exactly one or two **positional-only** arguments; the argument-count errors
@@ -307,10 +307,9 @@ impl MontyIter {
                     self.index += 1;
                     Ok(Some(value))
                 } else {
-                    // Exhaustion is sticky, and is recorded ONLY for the two conditions the step
-                    // reports as `Ok(None)`: sentinel equality and a `StopIteration` the callable
-                    // raised. Any other error propagated via `?` and never reaches here, leaving the
-                    // iterator live for the next call - exactly as CPython behaves.
+                    // Exhaustion is sticky, and is recorded ONLY for sentinel equality - the single
+                    // condition the step reports as `Ok(None)`. Every exception propagated via `?`
+                    // and never reaches here, leaving the iterator live for the next call.
                     *done = true;
                     Ok(None)
                 }
@@ -474,10 +473,9 @@ impl<'h> HeapRead<'h, MontyIter> {
     /// - The reader this `HeapRead` holds on the *iterator* entry may safely stay alive across the
     ///   step: `dec_ref` only asserts on readers when it would actually free an entry, and every
     ///   caller keeps the iterator alive for the whole call.
-    /// - `done` is written **only** on the `Ok(None)` path, so a propagated error, which leaves via
-    ///   `?` before the second window, keeps the iterator usable - matching CPython. A `StopIteration`
-    ///   from the callable is not propagated: `callable_sentinel_step` reports it as `Ok(None)`, so it
-    ///   exhausts the iterator exactly as the sentinel does.
+    /// - `done` is written **only** on the `Ok(None)` path, which the step reports for sentinel
+    ///   equality alone. Every propagated error leaves via `?` before the second window is opened, so
+    ///   a raised exception keeps the iterator usable.
     fn advance_callable_sentinel(&mut self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
         // Window 1: copy the state out, then let the borrow on `vm.heap` end immediately.
         let (pair, done) = match &self.get(vm.heap).iter_value {
@@ -503,10 +501,9 @@ impl<'h> HeapRead<'h, MontyIter> {
             this.index += 1;
             Ok(Some(value))
         } else {
-            // Exhaustion is sticky and is recorded ONLY here - for sentinel equality and for a
-            // `StopIteration` the callable raised, the two conditions the step reports as `Ok(None)`.
-            // Any other error already propagated via `?` before this point, so a raised exception
-            // leaves `done` false and the iterator usable - exactly as CPython behaves.
+            // Exhaustion is sticky and is recorded ONLY here, for the sentinel equality that is the
+            // step's single `Ok(None)` condition. Every error already propagated via `?` before this
+            // point, so a raised exception leaves `done` false and the iterator usable.
             let IterValue::CallableSentinel { done, .. } = &mut this.iter_value else {
                 panic!("advance_callable_sentinel: iterator is not callable-driven");
             };
@@ -613,10 +610,9 @@ fn get_heap_item(
 /// Invokes the callable with zero arguments and compares the result to the sentinel using `==`
 /// rich value comparison. Returns `Ok(None)` when iteration stops and `Ok(Some(value))` otherwise.
 ///
-/// Iteration stops on either of the two conditions CPython's `calliter_iternext` recognises:
-/// the produced value compares equal to the sentinel - the value is then released and deliberately
-/// **not** yielded - or the callable raised `StopIteration`, which is consumed here rather than
-/// propagated. Every other exception propagates unchanged.
+/// Sentinel equality is the **only** stop condition: the equal value is released and deliberately
+/// **not** yielded. Every exception the callable raises propagates unchanged in type and message,
+/// because exception transparency on this path is unconditional.
 ///
 /// # Why the step suspends collection
 ///
@@ -641,11 +637,12 @@ fn get_heap_item(
 ///   iterator live after a *propagated* exception, exactly as CPython does. An exception from the
 ///   callable arrives as a `RunError` and so propagates unchanged in type and message; a failing
 ///   comparison arrives as a `ResourceError`, whose `RunError` conversion decides catchability.
-/// - `StopIteration` from the callable is the one exception that does **not** propagate. CPython's
-///   `calliter_iternext` clears it and releases the iterator's callable and sentinel, so the sentinel
-///   form terminates instead of aborting - which is what makes the `iter(lambda: next(inner), s)`
-///   wrapper idiom work. Only the *callable* is treated this way; a `StopIteration` from anywhere else
-///   in this function would still propagate, and the comparison cannot raise one.
+/// - **Never special-case an exception type here.** Transparency is unconditional, so no error may be
+///   inspected, converted, or swallowed - `StopIteration` included. CPython's `calliter_iternext` does
+///   clear a `StopIteration` raised by the callable and treats it as a second exhaustion signal; monty
+///   deliberately does not, because unchanged propagation of *every* callable exception is this form's
+///   specified contract. That difference is an intentional, documented decision, so re-introducing a
+///   filter here would break the contract rather than improve fidelity.
 fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapId) -> RunResult<Option<Value>> {
     // Per-step time limit. Instruction boundaries do not cover repeated advances inside a single
     // operation, which a pure-Rust drive loop performs, nor a direct callable that returns without
@@ -662,15 +659,9 @@ fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapI
         let mut owned_guard = HeapGuard::new(callable_sentinel_pair(vm, pair), vm);
         let ((callable, sentinel), vm) = owned_guard.as_parts();
 
-        let produced = match vm.evaluate_function("iter(callable, sentinel)", callable, ArgValues::Empty) {
-            Ok(produced) => produced,
-            // Exhaustion signalled by the callable, not by the sentinel. Consuming the exception here
-            // is what makes the caller record `done`, so the callable is never invoked again and a
-            // later `next()` raises a *fresh* `StopIteration` - which is why any message the callable
-            // attached is dropped, matching CPython's `PyErr_Clear()`.
-            Err(err) if is_stop_iteration(&err) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+        // Propagated with `?` and nothing more: whatever the callable raises reaches the caller
+        // unchanged in type and message, so no error can be mistaken for exhaustion.
+        let produced = vm.evaluate_function("iter(callable, sentinel)", callable, ArgValues::Empty)?;
 
         // The produced value needs its own guard because its fate is conditional: released when it
         // equals the sentinel, handed back to the caller otherwise, and released if the comparison
@@ -682,18 +673,6 @@ fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapI
         }
         Ok(Some(produced_guard.into_inner()))
     })
-}
-
-/// Returns whether `err` is a `StopIteration` raised by Python code.
-///
-/// Used by `callable_sentinel_step` to recognise the exhaustion signal CPython's `calliter_iternext`
-/// clears. Deliberately narrow: only the catchable `RunError::Exc` variant qualifies, so an
-/// uncatchable resource error and an internal interpreter error can never be mistaken for exhaustion
-/// and silently swallowed. `StopIteration` has no subclasses to consider, since monty has no
-/// user-defined classes, which is why an exact type comparison is faithful to CPython's
-/// `PyErr_ExceptionMatches`.
-fn is_stop_iteration(err: &RunError) -> bool {
-    matches!(err, RunError::Exc(raised) if raised.exc.exc_type() == ExcType::StopIteration)
 }
 
 /// Reads the `(callable, sentinel)` pair tuple backing a callable-driven iterator.
