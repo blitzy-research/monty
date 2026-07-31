@@ -25,6 +25,12 @@
 # Lists are the heap-allocated values tracked here. Ints, string literals and
 # plain module-level functions are immediates: they are not heap entries and so
 # never appear in the reference counts.
+#
+# The trailing reference-count directive also makes the CPython runner skip this
+# file, which is why the second section is where the one deliberate divergence
+# from CPython - a callable-raised StopIteration propagating rather than being
+# converted into exhaustion - is asserted. It could not live in the sibling
+# iter__callable_sentinel.py fixture, which runs under both interpreters.
 
 # === Released by the ForIter exhaustion arm ===
 # The iterator is deliberately never bound, so the for loop is its only owner,
@@ -54,9 +60,10 @@ assert calls == [3], 'two yields plus one sentinel probe invoke the callable thr
 # next() advances the iterator through a different path than ForIter, and needs
 # no binding to do it - next(iter(f, s)) is valid. The iterator is bound here so
 # that the same object can be advanced repeatedly, which is why releasing it
-# takes an explicit rebind of the name to an immediate. A propagated exception
-# must leave the iterator live, and exhaustion must be sticky, so no further
-# value is ever produced.
+# takes an explicit rebind of the name to an immediate. Sentinel equality is the
+# only thing that exhausts the iterator, so a propagated exception must leave it
+# live whatever that exception is, and once the sentinel has been seen exhaustion
+# must be sticky, so no further value is ever produced.
 attempts = [0]
 retained = ['retained']
 
@@ -65,7 +72,9 @@ def raise_then_stop():
     attempts[0] = attempts[0] + 1
     if attempts[0] == 1:
         raise ValueError('boom')
-    if attempts[0] > 2:
+    if attempts[0] == 2:
+        raise StopIteration('not exhaustion')
+    if attempts[0] > 3:
         return ['retained']
     return attempts[0]
 
@@ -76,10 +85,22 @@ try:
     assert False, 'expected the callable to raise ValueError'
 except ValueError as exc:
     assert str(exc) == 'boom', 'the exception from the callable propagates unchanged'
-assert next(probe) == 2, 'a propagated exception must not exhaust the iterator'
+# Transparency is unconditional, so StopIteration gets no special treatment: it
+# arrives with its own message rather than as an empty exhaustion signal, and it
+# leaves the iterator usable like any other exception. CPython's calliter_iternext
+# clears such a StopIteration and exhausts the iterator instead, which makes this
+# the one assertion in the feature the two interpreters disagree on - so it lives
+# in this ref-counts fixture, which the CPython runner skips, rather than in
+# iter__callable_sentinel.py, which runs under both.
+try:
+    next(probe)
+    assert False, 'expected the callable-raised StopIteration to propagate'
+except StopIteration as exc:
+    assert str(exc) == 'not exhaustion', 'a callable-raised StopIteration keeps its own message'
+assert next(probe) == 3, 'neither propagated exception exhausted the iterator'
 assert next(probe, 'DEF') == 'DEF', 'the equal-by-value heap result exhausts the iterator'
 assert next(probe, 'DEF') == 'DEF', 'exhaustion is sticky, so the default comes back again'
-assert attempts == [3], 'the callable is never invoked again once the sentinel has been seen'
+assert attempts == [4], 'the callable is never invoked again once the sentinel has been seen'
 probe = None
 
 # === Both arguments released by the eager callability check ===

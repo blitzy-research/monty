@@ -28,6 +28,44 @@ for value in iter(lambda: queue.pop(0), ''):
 assert result == ['a', 'b'], 'a lambda callable drives the sentinel iterator'
 assert queue == [], 'the sentinel value itself was consumed from the queue'
 
+# Every kind of callable the eager check accepts must actually be invoked, not
+# merely accepted, so each one below drives a real iteration. Plain functions and
+# lambdas are covered above; a builtin, a closure over an enclosing local and a
+# function with default arguments are three separate dispatch paths.
+# A builtin: int() produces 0 on every call, so the integer sentinel 0 stops it
+# on the first probe - enough to prove a builtin is both accepted and called.
+assert [v for v in iter(int, 0)] == [], 'the builtin int is accepted as a callable and int() returns the sentinel'
+
+
+def make_counter():
+    running = [0]
+
+    def bump():
+        running[0] = running[0] + 1
+        return running[0]
+
+    return bump
+
+
+result = []
+for value in iter(make_counter(), 3):
+    result.append(value)
+assert result == [1, 2], 'a closure over an enclosing local drives the sentinel iterator'
+
+stepped = [0]
+
+
+def step_by(step=2):
+    stepped[0] = stepped[0] + step
+    return stepped[0]
+
+
+result = []
+for value in iter(step_by, 6):
+    result.append(value)
+assert result == [2, 4], 'a function with default arguments drives the sentinel iterator'
+assert stepped == [6], 'the default argument applied on all three calls, the sentinel probe included'
+
 # === Immediate sentinel yields nothing ===
 # The very first produced value equals the sentinel, so nothing is yielded and
 # the callable is invoked exactly once.
@@ -82,6 +120,16 @@ assert next(alias) == 1, 'the alias yields the first produced value'
 assert next(it) == 2, 'the original continues from where the alias left off'
 assert alias_calls[0] == 2, 'the two names share one iteration state, not two'
 
+# Self-iterability is also what lets a for loop consume an already-constructed
+# iterator at all, and that applies to every iterator rather than only to the
+# callable-driven one: a one-argument iterator must drive a for loop too. This is
+# the prerequisite every sentinel loop in this file relies on, so it is asserted
+# directly instead of only through the two-argument form.
+result = []
+for value in iter([1, 2, 3]):
+    result.append(value)
+assert result == [1, 2, 3], 'a for loop drives an already-constructed one-argument iterator'
+
 # === Exception propagation from the callable ===
 # The exception propagates unchanged in type and message, and it must NOT
 # exhaust the iterator: the step after it succeeds.
@@ -119,6 +167,42 @@ try:
 except ValueError as exc:
     assert str(exc) == 'kaboom', 'the exception propagates unchanged through the for loop'
 assert result == [], 'nothing was yielded before the callable raised'
+
+# A raise the callable cannot handle, because its own except clause is invalid.
+# That failure is reported while the callable is still mid-flight, so unlike the
+# cases above the interpreter has to clean up after a callable that was abandoned
+# rather than unwound, and the for loop still has to find its iterator afterwards.
+handler_calls = [0]
+
+
+def invalid_handler():
+    handler_calls[0] = handler_calls[0] + 1
+    try:
+        raise ValueError('inner')
+    except 123:
+        return 0
+
+
+result = []
+try:
+    for value in iter(invalid_handler, 0):
+        result.append(value)
+    assert False, 'expected the invalid except clause to raise TypeError'
+except TypeError as exc:
+    assert str(exc) == 'catching classes that do not inherit from BaseException is not allowed', (
+        'an invalid except clause inside the callable reports its own TypeError'
+    )
+assert result == [], 'nothing was yielded before the invalid except clause failed'
+assert handler_calls[0] == 1, 'the callable was invoked exactly once before it failed'
+
+# The abandoned callable left nothing behind: a further iteration, driven through
+# the very same for loop machinery, still produces exactly the right values.
+recovered = ['ok', 'go', '']
+result = []
+for value in iter(lambda: recovered.pop(0), ''):
+    result.append(value)
+assert result == ['ok', 'go'], 'iteration still works after the abandoned callable was cleaned up'
+assert recovered == [], 'the recovery drive consumed the whole queue including its sentinel'
 
 # === Argument-count errors ===
 # iter takes one or two positional-only arguments; both bounds keep their
