@@ -752,6 +752,17 @@ fn get_heap_item(
 ///   deliberately does not, because unchanged propagation of *every* callable exception is this form's
 ///   specified contract. That difference is an intentional, documented decision, so re-introducing a
 ///   filter here would break the contract rather than improve fidelity.
+/// - **Dispatchable is not completable: an external callable fails on the first step.** When the call
+///   resolves to an external, OS-call, method-call or await result, `VM::evaluate_function` hands back
+///   `RunError::internal` reading "iter(callable, sentinel): external functions are not yet supported
+///   in this context", because completing one requires suspending so the host can execute it and
+///   resume, which a synchronous re-entry cannot do. `MontyIter::is_callable` accepts those forms all
+///   the same, deliberately: it mirrors what `VM::call_function` can *dispatch*, which is the right
+///   question for rejecting a non-callable eagerly, so do not read the predicate as a promise that
+///   every value it admits can run to completion here. The limitation is **inherited, not introduced
+///   by this form** - `map`, `filter`, `sorted`, `min`, `max` and `list.sort` all reach the identical
+///   error through the same helper - so it is recorded here rather than worked around: narrowing it
+///   for this one iterator would mean changing shared call machinery every other caller depends on.
 fn callable_sentinel_step(vm: &mut VM<'_, '_, impl ResourceTracker>, pair: HeapId) -> RunResult<Option<Value>> {
     // Per-step time limit. Instruction boundaries do not cover repeated advances inside a single
     // operation, which a pure-Rust drive loop performs, nor a direct callable that returns without
