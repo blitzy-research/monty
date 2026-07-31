@@ -590,6 +590,34 @@ pub struct VM<'h, 'a, T: ResourceTracker> {
     /// across multiple `json.loads()` calls within a single execution. Lazily
     /// initialized on first use, cleaned up when the VM is dropped.
     pub(crate) json_string_cache: JsonStringCache,
+
+    /// Extra garbage-collection roots for heap entries that are alive only in Rust locals
+    /// while a nested interpreter run is in progress.
+    ///
+    /// `run_gc` derives its roots from `stack`, `globals`, `exception_stack` and the JSON
+    /// cache, and `Heap::collect_garbage` sweeps every entry those roots cannot reach —
+    /// reference counts and active `HeapRead` reader counts are deliberately ignored by the
+    /// mark phase. A builtin that holds a heap value only in a Rust local (for example the
+    /// argument popped by `next()`) and then re-enters the VM therefore has to publish that
+    /// value here, or the collector may free it mid-call.
+    ///
+    /// Managed exclusively through [`VM::with_temp_root`], which pushes and pops in a
+    /// matched pair, so the invariant is that this list is **empty at every instruction
+    /// boundary**. That is why `VMSnapshot` carries no counterpart field: a snapshot can
+    /// only be taken where execution suspends, and the nested-call helpers that use temp
+    /// roots cannot suspend.
+    temp_roots: Vec<HeapId>,
+
+    /// Nesting depth of runtime-Rust re-entries that must not be interrupted by a collection.
+    ///
+    /// Zero means collection is enabled. Any positive value means a nested `run()` loop is
+    /// executing underneath runtime Rust that holds heap values in **Rust locals** - values no
+    /// root registry can enumerate, because they live in the Rust call stack rather than in the
+    /// operand stack, globals or a heap entry. Managed exclusively through
+    /// [`VM::with_gc_paused`], so the invariant is that it is **zero at every instruction
+    /// boundary of the outermost run loop**, which is also why `VMSnapshot` carries no
+    /// counterpart.
+    gc_pause_depth: u32,
 }
 
 impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
@@ -613,6 +641,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
             json_string_cache: JsonStringCache::default(),
+            temp_roots: Vec::new(),
+            gc_pause_depth: 0,
         }
     }
 
@@ -675,6 +705,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             module_code: Some(module_code),
             ext_function_load_ip: None,
             json_string_cache: JsonStringCache::default(),
+            temp_roots: Vec::new(),
+            gc_pause_depth: 0,
         }
     }
 
@@ -1705,22 +1737,96 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Runs garbage collection with proper GC roots.
     ///
-    /// GC roots include values in the stack (locals + operands), globals, and exception stack.
+    /// GC roots include values in the stack (locals + operands), globals, the exception stack,
+    /// and the temporary roots published by [`VM::with_temp_root`] for heap entries that a
+    /// nested interpreter run keeps alive only through a Rust local.
+    ///
+    /// Does nothing while collection is paused by [`VM::with_gc_paused`]. The check lives here,
+    /// at the single entry point to collection, so the pause cannot be bypassed. Nothing is lost
+    /// by skipping: `Heap::should_gc` stays true (neither `allocations_since_gc` nor
+    /// `may_have_cycles` is reset), so the collection happens on the next instruction executed
+    /// once the pause ends.
     fn run_gc(&mut self) {
+        if self.gc_pause_depth > 0 {
+            return;
+        }
+
         // Collect roots from all reachable values
         let stack_roots = self.stack.iter().filter_map(Value::ref_id);
         let globals_roots = self.globals.iter().filter_map(Value::ref_id);
         let exc_roots = self.exception_stack.iter().filter_map(Value::ref_id);
         let json_cache_roots = self.json_string_cache.gc_roots();
+        let temp_roots = self.temp_roots.iter().copied();
 
         // Collect all roots into a vec to avoid lifetime issues
         let roots: Vec<HeapId> = stack_roots
             .chain(globals_roots)
             .chain(exc_roots)
             .chain(json_cache_roots)
+            .chain(temp_roots)
             .collect();
 
         self.heap.collect_garbage(roots);
+    }
+
+    /// Runs `f` with `id` registered as an additional garbage-collection root.
+    ///
+    /// Use this whenever runtime Rust code re-enters the interpreter (via
+    /// `VM::evaluate_function` or any other path that runs a nested `run()` loop) while a heap
+    /// entry is reachable *only* from a Rust local. `run_gc` builds its root set from the
+    /// operand stack, globals, the exception stack and the JSON cache, and
+    /// `Heap::collect_garbage` frees every entry the mark phase cannot reach — so neither the
+    /// entry's reference count nor an active `HeapRead` on it protects it. Publishing the id
+    /// here closes that window: marking the entry also marks everything reachable from it, so
+    /// a whole object graph can be protected by rooting the single entry that owns it.
+    ///
+    /// # Foot-guns
+    ///
+    /// - This roots the entry, it does **not** own it. The caller must still hold a reference
+    ///   count for the duration (temp rooting keeps the collector away, it does not stop
+    ///   `dec_ref` from freeing an entry whose last reference is released).
+    /// - Register the entry that state is written back **through**, not merely the entry that
+    ///   holds the interesting values: rooting a child keeps the child alive while the parent
+    ///   being mutated is swept.
+    /// - Scope it as tightly as the nested call. A root that outlives the call turns into a
+    ///   leak, which is why this is a scoped combinator rather than a push/pop pair.
+    pub(crate) fn with_temp_root<R>(&mut self, id: HeapId, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.temp_roots.push(id);
+        let result = f(self);
+        self.temp_roots.pop();
+        result
+    }
+
+    /// Runs `f` with garbage collection suspended.
+    ///
+    /// [`VM::with_temp_root`] can only protect a heap entry whose id the caller knows. It cannot
+    /// protect the heap values that *enclosing* runtime-Rust frames hold in their own locals —
+    /// for example the temporary `Set` a dict-view operator accumulates, or the result list a
+    /// builtin is filling — because those live in the Rust call stack, which the collector has no
+    /// way to walk. Wrap a re-entry into the interpreter in this guard when arbitrary runtime-Rust
+    /// frames may be live above it, so a collection triggered inside the nested run cannot free
+    /// values those frames still hold.
+    ///
+    /// Suspension is not cancellation: `Heap::should_gc` remains true throughout, so the pending
+    /// collection runs on the next instruction executed after the pause ends. Postponement is
+    /// therefore bounded by the duration of the nested call, and it resumes exactly where it is
+    /// safe again — an instruction boundary with no runtime-Rust locals in play.
+    ///
+    /// # Foot-guns
+    ///
+    /// - This is a conservative blanket, not a substitute for correct rooting. Keep using
+    ///   [`VM::with_temp_root`] for entries you own; that invariant must hold on its own terms so
+    ///   it survives any future narrowing of this pause.
+    /// - Scope it as tightly as the nested call. Holding the pause longer than necessary lets
+    ///   unreachable cycles accumulate, which under a memory-limited `ResourceTracker` turns into
+    ///   a spurious allocation failure rather than a collection.
+    /// - Do not use it to paper over a missing `drop_with_heap`: it suspends *tracing*
+    ///   collection only, and has no effect on reference counting.
+    pub(crate) fn with_gc_paused<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.gc_pause_depth += 1;
+        let result = f(self);
+        self.gc_pause_depth -= 1;
+        result
     }
 
     /// Returns the current source position for traceback generation.
