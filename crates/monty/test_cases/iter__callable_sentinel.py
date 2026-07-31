@@ -264,6 +264,81 @@ assert stop_calls[0] == 1, 'a second next() must not re-invoke the callable'
 assert next(it, 'DEF') == 'DEF', 'next(it, default) returns the default once exhausted'
 assert stop_calls[0] == 1, 'next(it, default) must not re-invoke the callable'
 
+# === Re-entrant exhaustion outranks an in-flight result ===
+# The callable recursively advances the SAME iterator, and that inner advance is the
+# one that sees the sentinel, so the iterator is already exhausted by the time the
+# outer step has a value of its own. That value belongs to a stopped iterator and is
+# therefore discarded rather than yielded, leaving the outer next() to return its
+# default. The iterator is reached through a list because a callable can only read
+# globals that already exist where it is defined.
+reentrant_calls = [0]
+reentrant_holder = []
+reentrant_inner = []
+
+
+def reentrant_driver():
+    reentrant_calls[0] = reentrant_calls[0] + 1
+    if reentrant_calls[0] == 1:
+        reentrant_inner.append(next(reentrant_holder[0], 'INNER'))
+        return ['late']
+    return 0
+
+
+it = iter(reentrant_driver, 0)
+reentrant_holder.append(it)
+assert next(it, 'OUTER') == 'OUTER', 'a value produced after a re-entrant stop is discarded, not yielded'
+assert reentrant_inner == ['INNER'], 'the recursive advance is the one that saw the sentinel'
+assert reentrant_calls[0] == 2, 'the outer step plus its one recursive step invoke the callable twice'
+assert next(it, 'AFTER') == 'AFTER', 'a re-entrant stop is exactly as sticky as an ordinary one'
+assert reentrant_calls[0] == 2, 'no further call is made once the iterator has stopped'
+
+# the same collision driven by a for loop, which advances through ForIter rather than
+# next(), so the discarded value must never reach the loop variable either
+forloop_calls = [0]
+forloop_holder = []
+forloop_inner = []
+
+
+def forloop_driver():
+    forloop_calls[0] = forloop_calls[0] + 1
+    if forloop_calls[0] == 1:
+        forloop_inner.append(next(forloop_holder[0], 'INNER'))
+        return ['late']
+    return 0
+
+
+it = iter(forloop_driver, 0)
+forloop_holder.append(it)
+result = []
+for value in it:
+    result.append(value)
+assert result == [], 'the for loop yields nothing when a re-entrant advance already stopped the iterator'
+assert forloop_inner == ['INNER'], 'the recursive advance saw the sentinel while the loop step was in flight'
+assert forloop_calls[0] == 2, 'the loop leaves the callable invoked exactly twice'
+
+# a re-entrant advance that does NOT reach the sentinel must not suppress anything:
+# only exhaustion outranks the in-flight value, so both values are still yielded
+nested_calls = [0]
+nested_holder = []
+nested_inner = []
+
+
+def nested_driver():
+    nested_calls[0] = nested_calls[0] + 1
+    if nested_calls[0] == 1:
+        nested_inner.append(next(nested_holder[0], 'INNER'))
+        return 'outer'
+    return nested_calls[0]
+
+
+it = iter(nested_driver, 99)
+nested_holder.append(it)
+assert next(it, 'DEF') == 'outer', 'a re-entrant advance that kept the iterator live still yields the outer value'
+assert nested_inner == [2], 'the recursive advance yielded its own value rather than stopping'
+assert nested_calls[0] == 2, 'the outer step and its recursive step account for both calls'
+assert next(it, 'DEF') == 3, 'the iterator keeps producing after a re-entrant advance that did not stop it'
+assert nested_calls[0] == 3, 'the following step invokes the callable exactly once more'
+
 # === Comprehension form ===
 comp_calls = [0]
 
