@@ -1261,21 +1261,19 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     // `CallFunction` and `CallBuiltinFunction` below do, so this instruction stays
                     // resumable from the frame a nested unwind or `pop_frame` restore observes.
                     self.current_frame_mut().ip = cached_frame.ip;
-                    // Recorded because both cleanup arms below pop the iterator *by position*: see
-                    // `discard_frames_above`, which is what makes that assumption hold again after the
-                    // advance re-entered the interpreter.
+                    // Both cleanup arms below pop the iterator *by stack position*, and the advance may
+                    // re-enter the interpreter, so the pre-call depth is captured for
+                    // `discard_frames_above` to restore.
                     let frame_depth = self.frames.len();
                     let advanced = iter.advance(self);
                     // Drop the HeapRead before any dec_ref to release the reader count. No arm below
                     // needs it, and the frame cleanup that follows already releases heap values.
                     drop(iter);
-                    // Defence in depth for the by-position pops below. The advance itself already
-                    // restores the depth - a callable-driven iterator re-enters the VM inside
-                    // `with_frame_state_restored`, which every consumer of that advance shares - so
-                    // this is a no-op today. It stays because the invariant it protects is local: an
-                    // advance path that ever re-entered the interpreter without that guard would
-                    // otherwise leave the callee's locals and operands stacked above the iterator and
-                    // corrupt the pops.
+                    // Defence in depth for the by-position pops below: an advance that returns with
+                    // callee frames still registered leaves their locals and operands stacked above the
+                    // iterator, which would corrupt those pops. A callable-driven advance re-enters the
+                    // VM inside `with_frame_state_restored`, so it hands back the depth already restored
+                    // and this finds nothing to discard.
                     self.discard_frames_above(frame_depth);
                     // Pin `instruction_ip` to the cached IP this arm reasons about. The advance already
                     // restored the value the instruction started with, through the same shared guard;
@@ -1740,12 +1738,10 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// error `f` produces is handed back to a Python-visible operation. Re-entry can return with the
     /// callee's frames still registered (see [`VM::discard_frames_above`] for why they survive) and
     /// with `instruction_ip` pointing inside the callee, because `pop_frame` re-points it at every
-    /// parent it uncovers. Either one makes the *caller's* exception handling wrong: `handle_exception`
-    /// searches `self.frames.last()` at `instruction_ip`, so it would inspect an abandoned callee
-    /// frame instead of the frame that actually executed the instruction, and that search then stops
-    /// at the `should_return` boundary [`VM::evaluate_function`] marked - reporting the exception as
-    /// unhandled even though the caller has a matching `try`/`except`. Restoring the depth and the
-    /// instruction pointer puts the lookup back on the caller.
+    /// parent it uncovers. Since `handle_exception` searches `self.frames.last()` at `instruction_ip`,
+    /// either one sends the *caller's* handler lookup into an abandoned frame and stops it at the
+    /// `should_return` boundary [`VM::evaluate_function`] marked, reporting a catchable exception as
+    /// unhandled.
     ///
     /// # The guarantee
     ///
@@ -1754,18 +1750,16 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// is passed through untouched, so an exception keeps its type, message and traceback exactly as
     /// `f` produced them.
     ///
-    /// # Foot-guns
+    /// # Caller obligations
     ///
-    /// - It restores *control* state only. Heap values `f` produced or held in Rust locals remain the
-    ///   caller's responsibility (`HeapGuard`/`defer_drop!`), and protecting them from collection is
-    ///   [`VM::with_gc_paused`]'s job, not this guard's.
-    /// - Wrap the **whole** nested region, error propagation included. Calling `f` outside the guard
-    ///   and entering it afterwards defeats the point, because the error path is exactly the one that
-    ///   needs the restored state.
-    /// - It deliberately does **not** write `frame.ip`. A caller that must leave its own frame
-    ///   resumable syncs it first, the way `Opcode::CallFunction`, `Opcode::CallBuiltinFunction` and
-    ///   `Opcode::ForIter` do; this guard owns only the state that exception routing and position
-    ///   reporting read.
+    /// - Guard heap values separately: this restores *control* state only. Values `f` produced or held
+    ///   in Rust locals remain the caller's responsibility (`HeapGuard`/`defer_drop!`), and protecting
+    ///   them from collection is [`VM::with_gc_paused`]'s job.
+    /// - Wrap the **whole** nested region, error propagation included; the error path is exactly the
+    ///   one that needs the restored state.
+    /// - Synchronize a resumable `frame.ip` separately: this guard deliberately does not write it, so
+    ///   a caller that must leave its own frame resumable syncs it first, the way
+    ///   `Opcode::CallFunction`, `Opcode::CallBuiltinFunction` and `Opcode::ForIter` do.
     pub(crate) fn with_frame_state_restored<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let depth = self.frames.len();
         let instruction_ip = self.instruction_ip;
@@ -1782,24 +1776,17 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// A nested `run()` loop normally unwinds itself: `try_catch_sync!` and `catch_sync!` route an
     /// exception through `handle_exception`, which pops frames until it reaches the `should_return`
     /// boundary [`VM::evaluate_function`] marked, so the depth is already restored when the `Err`
-    /// surfaces. Any error that leaves the loop *without* that routing skips the unwinding with it,
-    /// and hands back an `Err` with the callee frames still registered and their locals and operands
-    /// still stacked above the caller's. Today that means the `Heap::check_time` at the top of the
-    /// loop plus the direct `?` and `return Err` exits inside opcode arms - the heap allocations in
-    /// `MakeFunction` and `MakeClosure`, the exception-type check in `CheckExcMatch`, the
-    /// internal-error guards - but treat that as illustrative rather than exhaustive: what defines
-    /// the set is the *shape*, so any arm added later that returns an error without going through
-    /// `catch_sync!` joins it.
+    /// surfaces. An error that leaves the loop *without* that routing skips the unwinding with it, and
+    /// hands back an `Err` with the callee frames still registered and their locals and operands still
+    /// stacked above the caller's. The `Heap::check_time` at the top of the loop and the direct `?` and
+    /// `return Err` exits inside opcode arms are examples rather than the whole set - what defines it is
+    /// the *shape*, so any arm that returns an error without going through `catch_sync!` belongs to it.
     ///
     /// Every caller that re-enters the interpreter must therefore restore the depth before it either
     /// addresses the operand stack *by position* or lets the error reach `handle_exception`, whose
-    /// handler lookup starts at the frame that is current when it runs. [`VM::with_frame_state_restored`]
-    /// is how that restoration is obtained, and wrapping the re-entry itself is what makes it hold for
-    /// *every* consumer of the re-entering operation rather than for one opcode arm: advancing a
-    /// callable-driven `iter(callable, sentinel)` iterator is driven by `Opcode::ForIter`, by the
-    /// `next()` builtin and by dict-view set operators alike. `Opcode::ForIter` additionally restores
-    /// the depth inline, as defence in depth for the iterator it pops by position. This all mirrors
-    /// how `evaluate_function` abandons the frames of an evaluation it could not complete.
+    /// handler lookup starts at the frame that is current when it runs. Wrapping the re-entry in
+    /// [`VM::with_frame_state_restored`] obtains that restoration for every consumer of the
+    /// re-entering operation rather than for one opcode arm.
     ///
     /// # Foot-gun
     ///

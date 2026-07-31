@@ -28,12 +28,9 @@ for value in iter(lambda: queue.pop(0), ''):
 assert result == ['a', 'b'], 'a lambda callable drives the sentinel iterator'
 assert queue == [], 'the sentinel value itself was consumed from the queue'
 
-# Every kind of callable the eager check accepts must actually be invoked, not
-# merely accepted, so each one below drives a real iteration. Plain functions and
-# lambdas are covered above; a builtin, a closure over an enclosing local and a
-# function with default arguments are three separate dispatch paths.
-# A builtin: int() produces 0 on every call, so the integer sentinel 0 stops it
-# on the first probe - enough to prove a builtin is both accepted and called.
+# Builtins, closures over an enclosing local and functions with default arguments
+# are each accepted and invoked through their own dispatch path. int() produces 0 on
+# every call, so the integer sentinel 0 stops that iteration on the first probe.
 assert [v for v in iter(int, 0)] == [], 'the builtin int is accepted as a callable and int() returns the sentinel'
 
 
@@ -120,11 +117,8 @@ assert next(alias) == 1, 'the alias yields the first produced value'
 assert next(it) == 2, 'the original continues from where the alias left off'
 assert alias_calls[0] == 2, 'the two names share one iteration state, not two'
 
-# Self-iterability is also what lets a for loop consume an already-constructed
-# iterator at all, and that applies to every iterator rather than only to the
-# callable-driven one: a one-argument iterator must drive a for loop too. This is
-# the prerequisite every sentinel loop in this file relies on, so it is asserted
-# directly instead of only through the two-argument form.
+# A one-argument iterator is self-iterable too, so a for loop that asks it for its
+# iterator gets the same object back and drives it directly.
 result = []
 for value in iter([1, 2, 3]):
     result.append(value)
@@ -205,9 +199,8 @@ assert result == ['ok', 'go'], 'iteration still works after the abandoned callab
 assert recovered == [], 'the recovery drive consumed the whole queue including its sentinel'
 
 # The same abandoned callable driven by next(), which reaches the iterator through a
-# builtin call rather than through the for loop. Every drive path has to report the
-# failure to the handler that surrounds it, so this case is not a duplicate of the one
-# above: it is the only one that covers the next() route out of a mid-flight callable.
+# builtin call rather than the for loop: that route unwinds to the surrounding handler
+# as well, and leaves the iterator usable afterwards.
 next_handler_calls = [0]
 
 
@@ -232,9 +225,8 @@ except TypeError as exc:
 assert next(it) == 2, 'the iterator is still usable after the abandoned callable'
 assert next_handler_calls[0] == 2, 'the failed step and the following one account for both calls'
 
-# And driven by a dict-view set operator, the third way an iterator object is advanced:
-# it is neither a for loop nor next(), so it is the remaining route that has to surface
-# the failure to the surrounding handler.
+# And driven by a dict-view set operator, which advances an iterator object directly:
+# a failure inside the callable reaches the surrounding handler on that route too.
 view_handler_calls = [0]
 
 
@@ -255,8 +247,8 @@ except TypeError as exc:
     )
 assert view_handler_calls[0] == 1, 'the callable was invoked exactly once before it failed'
 
-# the same operator, now with a callable that behaves, proving nothing about the
-# abandoned one was left behind on this route either
+# a further drive through the same operator, with a callable that behaves: no state
+# from the abandoned one remains on this route either
 view_queue = ['b', 'c', '']
 union = {'a': 1}.keys() | iter(lambda: view_queue.pop(0), '')
 assert sorted(union) == ['a', 'b', 'c'], 'a dict-view set operator consumes a sentinel iterator'
