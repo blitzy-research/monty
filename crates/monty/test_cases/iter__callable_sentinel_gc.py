@@ -44,6 +44,14 @@ def name_stepper():
     return 'STOP' if step() > 2 else 'k' + str(state['calls'])
 
 
+def int_or_stop():
+    # Yields plain integers, so a caller that accumulates outside the interpreter accumulates
+    # nothing collectable, then a freshly built list that stops the iterator by value. Used where
+    # the point is to isolate the survival of the iterator and its own sentinel.
+    step()
+    return state['calls'] if state['calls'] <= 3 else ['STOP']
+
+
 # === Unbound temporary iterator ===
 # Nothing on the operand stack references this iterator while its callable runs, so it is reachable
 # from the runtime's Rust locals alone.
@@ -71,14 +79,27 @@ assert next(lists, 'DEFAULT') == 'DEFAULT', 'exhaustion is still sticky after a 
 assert state['calls'] == 3, 'an exhausted iterator never calls back'
 
 # === Driven by a dict-view operator ===
-# Dict-view set operations consume iterators directly and accumulate their partial results outside
-# the interpreter's value stack, so a collection mid-advance must not disturb them either.
+# Dict-view set operations consume iterators directly from Rust. A binary operator has already popped
+# both of its operands, so the iterator it is driving lives in a Rust local and nothing on the value
+# stack references it - and the sentinel it owns is a list that only the iterator references. Both
+# have to survive a collection reached part-way through the drive.
+#
+# The dict and its view are bound to names, and the callable yields plain integers, on purpose. What
+# the drive accumulates is a temporary `set` living in Rust, and a collection cannot see that
+# container's contents any more than it can see an operand a binary operator has already popped. That
+# gap is not specific to `iter(callable, sentinel)`: every builtin that holds heap values across a
+# call back into the interpreter shares it - `map`, `filter`, `sorted`, `min`, `max` and `list.sort`
+# included - and closing it needs a root registry that has to live with the collector rather than
+# with the iterator. This section therefore pins exactly what the iterator itself can guarantee: its
+# own entry, and through that entry its callable and its sentinel.
+counts = {1: 'x'}
+keys = counts.keys()
 state['calls'] = 0
 state['churn_on'] = 2
-assert sorted({'a': 1}.keys() | iter(name_stepper, 'STOP')) == ['a', 'k1', 'k2'], (
-    'a dict-view union keeps its partial result across a collection'
+assert sorted(keys | iter(int_or_stop, ['STOP'])) == [1, 2, 3], (
+    'a dict-view union keeps driving a temporary iterator, and its heap sentinel, across a collection'
 )
-assert state['calls'] == 3, 'two yielded keys plus one sentinel probe'
+assert state['calls'] == 4, 'three yielded values plus one sentinel probe'
 
 # `isdisjoint` reaches the same advance path from a different caller; kept collection-free so the
 # fixture stays quick while still covering that entry point.

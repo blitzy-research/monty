@@ -590,18 +590,6 @@ pub struct VM<'h, 'a, T: ResourceTracker> {
     /// across multiple `json.loads()` calls within a single execution. Lazily
     /// initialized on first use, cleaned up when the VM is dropped.
     pub(crate) json_string_cache: JsonStringCache,
-
-    /// Nesting depth of runtime-Rust re-entries that must not be interrupted by a collection.
-    ///
-    /// Zero means collection is enabled. Any positive value means a nested `run()` loop is
-    /// executing underneath runtime Rust that holds heap values in **Rust locals** - values no
-    /// root registry can enumerate, because they live in the Rust call stack rather than in the
-    /// operand stack, globals, the exception stack or the JSON cache that [`VM::run_gc`] walks.
-    /// Managed exclusively through [`VM::with_gc_paused`], so the invariant is that it is
-    /// **zero at every instruction boundary of the outermost run loop**, which is also why
-    /// `VMSnapshot` carries no counterpart field: a snapshot can only be taken where execution
-    /// suspends, and a paused region cannot suspend.
-    gc_pause_depth: u32,
 }
 
 impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
@@ -625,7 +613,6 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
             json_string_cache: JsonStringCache::default(),
-            gc_pause_depth: 0,
         }
     }
 
@@ -688,7 +675,6 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             module_code: Some(module_code),
             ext_function_load_ip: None,
             json_string_cache: JsonStringCache::default(),
-            gc_pause_depth: 0,
         }
     }
 
@@ -1264,13 +1250,19 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     // returns; a stale `ip` there would misdirect both the exception-table lookup
                     // and traceback position reporting for the remainder of this instruction.
                     self.current_frame_mut().ip = cached_frame.ip;
-                    // `pop_frame` overwrites `instruction_ip` itself, so save and restore it: the
-                    // error arm below resolves handlers and reports positions through
-                    // `instruction_ip`, which must keep pointing at this ForIter instruction rather
-                    // than at the byte after its operand.
-                    let instruction_ip = self.instruction_ip;
                     let advanced = iter.advance(self);
-                    self.instruction_ip = instruction_ip;
+                    // `pop_frame` overwrites `instruction_ip` from the parent frame's `ip` when a
+                    // nested frame returns, so restore it before anything below reads it: the error
+                    // arm resolves handlers and reports positions through `instruction_ip`.
+                    // `cached_frame.ip` is the value to restore because it is exactly what was just
+                    // written to the frame above, so this leaves the same state every other
+                    // frame-pushing instruction leaves - `CallFunction` and `CallBuiltinFunction`
+                    // sync the frame the same way and never restore afterwards. Positions stay
+                    // right because the instruction that follows a `ForIter` is always the store of
+                    // the loop target, which the compiler attributes to the same `for` statement,
+                    // and handler lookup stays right because that store is inside the same `try`
+                    // range whenever the `ForIter` is.
+                    self.instruction_ip = cached_frame.ip;
 
                     match advanced {
                         Ok(Some(value)) => self.push(value),
@@ -1751,19 +1743,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Runs garbage collection with proper GC roots.
     ///
-    /// GC roots include values in the stack (locals + operands), globals, the exception stack
-    /// and the JSON string cache.
-    ///
-    /// Does nothing while collection is suspended by [`VM::with_gc_paused`]. The check lives
-    /// here, at the single entry point to collection, so the suspension cannot be bypassed by a
-    /// future caller. Nothing is lost by skipping: only `Heap::collect_garbage` clears
-    /// `allocations_since_gc` and `may_have_cycles`, so a due collection stays due and runs at the
-    /// first instruction boundary reached with no suspension active.
+    /// GC roots include values in the stack (locals + operands), globals, and exception stack.
     fn run_gc(&mut self) {
-        if self.gc_pause_depth > 0 {
-            return;
-        }
-
         // Collect roots from all reachable values
         let stack_roots = self.stack.iter().filter_map(Value::ref_id);
         let globals_roots = self.globals.iter().filter_map(Value::ref_id);
@@ -1778,56 +1759,6 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             .collect();
 
         self.heap.collect_garbage(roots);
-    }
-
-    /// Runs `f` with garbage collection suspended.
-    ///
-    /// Wrap a re-entry into the interpreter in this guard whenever runtime Rust holds heap values
-    /// that the collector cannot see. [`VM::run_gc`] builds its root set from the operand stack,
-    /// globals, the exception stack and the JSON cache, and `Heap::collect_garbage` frees every
-    /// entry the mark phase cannot reach — it ignores both reference counts and active `HeapRead`
-    /// reader counts. Anything reachable only from the **Rust call stack** is therefore invisible
-    /// to it, and nothing can be published as a root on its behalf: a Rust local cannot be
-    /// enumerated, and a `HeapRead` does not even carry the `HeapId` of the entry it points at.
-    /// Suspending collection for the duration of the nested run is what closes that window.
-    ///
-    /// The one caller today is `types::iter`'s callable-driven iterator step, which invokes a
-    /// user callable from inside an iterator advance and afterwards writes its step state back
-    /// through an iterator entry that `next(iter(f, s))` keeps alive only through the popped
-    /// argument list. The same protection covers whatever the enclosing runtime-Rust frame is
-    /// accumulating, such as the temporary `Set` a dict-view operator fills while driving that
-    /// iterator.
-    ///
-    /// Suspension is not cancellation, and it does not reset the collector's scheduling state.
-    /// `Heap::should_gc` is `may_have_cycles && allocations_since_gc >= GC_INTERVAL` and only
-    /// `Heap::collect_garbage` clears either field, so the pause touches neither while allocations
-    /// made by the nested run keep moving them exactly as usual. A collection that was due stays
-    /// due; one that first becomes due inside the guarded region is simply serviced later.
-    ///
-    /// "Later" is the next **instruction boundary of the run loop**, which is the only place
-    /// [`VM::run_gc`] is reached and the only place where no runtime-Rust locals are in play. That
-    /// is not necessarily the instant this call returns: only the guard's lifetime is bounded to the
-    /// nested call, so a runtime-Rust loop that re-enters the interpreter several times within one
-    /// instruction — as a dict-view operator driving an iterator does — postpones the collection
-    /// across all of those re-entries, which is exactly the interval over which its accumulating
-    /// locals need protecting. Resource accounting is untouched either way: allocation, memory and
-    /// time limits are enforced by the `ResourceTracker`, not by the collector, so a runaway
-    /// callable still trips them.
-    ///
-    /// # Foot-guns
-    ///
-    /// - Scope it as tightly as the nested call. Holding the suspension longer than necessary
-    ///   lets unreachable cycles accumulate, which under a memory-limited `ResourceTracker`
-    ///   surfaces as a spurious allocation failure rather than a collection.
-    /// - Do not use it to paper over a missing `drop_with_heap`: it suspends *tracing* collection
-    ///   only, and has no effect on reference counting.
-    /// - It protects against the collector, not against `dec_ref`. The caller must still hold a
-    ///   reference count on anything it needs to stay alive.
-    pub(crate) fn with_gc_paused<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.gc_pause_depth += 1;
-        let result = f(self);
-        self.gc_pause_depth -= 1;
-        result
     }
 
     /// Returns the current source position for traceback generation.

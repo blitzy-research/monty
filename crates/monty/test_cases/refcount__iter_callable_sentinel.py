@@ -1,13 +1,13 @@
 # Ownership tests for iter(callable, sentinel): reference counts and cleanup on every exit path.
 #
 # A callable-driven iterator owns its callable and its sentinel through a hidden two-element pair
-# tuple, so the only way to assert that ownership from Python is to release every iterator and every
+# list, so the only way to assert that ownership from Python is to release every iterator and every
 # produced value by the end of the file and then require that:
 #   * each retained heap object is directly bound and its count is exactly its number of bindings -
 #     a leaked clone of a callable, sentinel or produced value shows up as a count that is too high,
 #     and an over-release trips the ref-count-panic build, and
 #   * every live heap entry is reachable from a binding - the harness compares unique references
-#     against the heap entry count - so an orphaned iterator, pair tuple or dropped produced value
+#     against the heap entry count - so an orphaned iterator, pair list or dropped produced value
 #     is a failure.
 #
 # The step's exit paths are covered below: a yielded value, a value equal to the sentinel, an
@@ -30,7 +30,7 @@
 
 # === Normal yield and sentinel stop ===
 # Two heap values are yielded and a third, equal to the sentinel by value, is produced and dropped.
-# The dropped value must not survive as an orphan, and the sentinel must not keep the pair tuple's
+# The dropped value must not survive as an orphan, and the sentinel must not keep the pair list's
 # reference once the iterator is released. The `for` loop also drives the iterator through the
 # GetIter pass-through, so the loop must not add an unbalanced reference to it either.
 state = {'calls': 0}
@@ -54,7 +54,7 @@ value = None
 
 # === Exhaustion, self-iterability and release ===
 # Re-wrapping an iterator returns the identical object, so it must not add a reference that the
-# release below cannot undo; an exhausted iterator still owns its pair tuple until its last binding
+# release below cannot undo; an exhausted iterator still owns its pair list until its last binding
 # goes, and the default handed to next() must come back as the very same object.
 exhaust_state = {'calls': 0}
 exhaust_stop = ['DONE']
@@ -88,7 +88,7 @@ exhaust_iter = None
 
 # === Release without draining, with a heap callable ===
 # A function carrying a default is itself a heap object, so releasing a partly consumed iterator has
-# to release the pair tuple, and through it both the callable and the sentinel. Leaking the pair
+# to release the pair list, and through it both the callable and the sentinel. Leaking the pair
 # would leave this callable at a count of two.
 undrained_state = {'calls': 0}
 undrained_stop = ['NEVER']
