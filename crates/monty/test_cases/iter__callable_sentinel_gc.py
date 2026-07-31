@@ -156,3 +156,43 @@ holder = ['DEFAULT']
 assert next(iter(stop_stepper, []), holder) is holder, 'the exact default object is returned after a collection'
 assert holder == ['DEFAULT'], 'and it is handed back unchanged'
 assert state['calls'] == 1, 'the terminal step is still a single call'
+
+# === Nested steps ===
+# A callable may itself drive a second callable-sentinel iterator, so one step runs inside another
+# and the suspension nests. It has to be released exactly as often as it was taken: a depth that
+# never returned to zero would silently disable collection for the rest of the run, and one released
+# too early would expose the outer step's own graph while the inner one is still running. The inner
+# callable is what allocates, so the collection becomes due at the deepest point - with two
+# iterators, two hidden callable/sentinel pairs, the inner accumulator and the outer accumulator all
+# live at once, and every one of them owned from somewhere the collector cannot see.
+inner_state = {'calls': 0}
+
+
+def inner_step():
+    inner_state['calls'] += 1
+    if inner_state['calls'] == 2 and state['calls'] == 0:
+        assert churn() == 120000, 'the churn helper must allocate on every iteration'
+    return ['i', inner_state['calls']] if inner_state['calls'] <= 2 else ['STOP']
+
+
+def outer_step():
+    # Drains an entire inner iterator per outer step, so the inner drive happens underneath the
+    # outer step's suspension rather than beside it.
+    inner_state['calls'] = 0
+    inner_gathered = []
+    for item in iter(inner_step, ['STOP']):
+        inner_gathered.append(item)
+    assert inner_state['calls'] == 3, 'each inner drive is two yielded values plus one sentinel probe'
+    state['calls'] += 1
+    return inner_gathered if state['calls'] <= 2 else []
+
+
+state['calls'] = 0
+state['churn_on'] = 0
+outer_gathered = []
+for item in iter(outer_step, []):
+    outer_gathered.append(item)
+assert outer_gathered == [[['i', 1], ['i', 2]], [['i', 1], ['i', 2]]], (
+    'nested callable-driven iterators survive a collection made due at the deepest step'
+)
+assert state['calls'] == 3, 'two yielded values plus one sentinel probe from the outer iterator'

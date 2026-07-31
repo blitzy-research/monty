@@ -415,14 +415,16 @@ impl MontyIter {
                 Ok(Some(item))
             }
             IterValue::CallableSentinel { pair, done } => {
-                // NOTE: this arm is currently unreachable. `IterValue::CallableSentinel` is only
-                // ever produced by `MontyIter::init`, and `IterValue::from_heap_data` returns
-                // `None` for `HeapData::Iter`, so `MontyIter::new` - the only route into a bare
-                // `MontyIter` - can never build one. It is implemented correctly rather than left
-                // as `unreachable!()` so the two advance paths cannot silently diverge if that
-                // ever changes; `HeapRead::advance` is the path Python code actually takes. Unlike
-                // there, `self` and `vm` are disjoint parameters, so `vm` can be handed to the
-                // nested call directly with no borrow window to juggle.
+                // NOTE: this arm is compile-time coverage only - it is currently unreachable from
+                // Python. `IterValue::CallableSentinel` is only ever produced by `MontyIter::init`,
+                // and `IterValue::from_heap_data` returns `None` for `HeapData::Iter`, so
+                // `MontyIter::new` - the only route into a bare `MontyIter` - can never build one.
+                // It is implemented correctly rather than left as `unreachable!()` so the two
+                // advance paths cannot silently diverge if that ever changes; `HeapRead::advance`
+                // is the path Python code actually takes, and it is the one the tests exercise.
+                // Unlike there, `self` and `vm` are disjoint parameters, so `vm` can be handed to
+                // the nested call directly with no borrow window to juggle. `size_hint` carries the
+                // same classification for the same reason.
                 if *done {
                     return Ok(None);
                 }
@@ -460,6 +462,16 @@ impl MontyIter {
                     list.len()
                 })
             }
+            // NOTE: like the matching arm in `for_next`, this one is compile-time coverage only and
+            // is currently unreachable from Python, for the same reason. Every caller holds a
+            // `MontyIter` that `MontyIter::new` built - `map`, `Set::from_iterator`, the dict-view
+            // slow path, and `MontyIter::collect` by way of `HeapedMontyIter` for `list` and `tuple`
+            // - and `IterValue::from_heap_data` returns `None` for `HeapData::Iter`, so none of them
+            // can be holding a callable-driven iterator. Such an iterator exists only inside the
+            // `HeapData::Iter` entry `MontyIter::init` allocates, and Python drives that exclusively
+            // through `HeapRead::advance`. Reporting 0 keeps the answer honest if that ever changes:
+            // the number of remaining steps is unknowable without invoking the callable, which a size
+            // hint must not do.
             IterValue::CallableSentinel { .. } => 0,
         };
         len.saturating_sub(self.index)

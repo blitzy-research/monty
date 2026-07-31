@@ -117,27 +117,69 @@ except ValueError as exc:
 assert next(flaky) == 3, 'a propagated exception does not exhaust the iterator'
 assert raising['n'] == 3, 'exactly one call per step, including the step that raised'
 
-# The same holds when a for loop is the driver: the exception escapes the loop statement, and the
-# values produced before it were already yielded.
+# The same holds when a for loop is the driver, and that route matters on its own: a for statement
+# reaches the iterator through a different opcode than next() does, and the callable below is a
+# plain function, so invoking it pushes a frame and runs a nested interpreter loop. The enclosing
+# try must still find its handler once that frame has been popped, so the flag below is asserted
+# rather than the assertion being left to `except`. The iterator is bound to a name so the step
+# after the error can be driven by hand: a for-driven error must leave it usable, exactly as a
+# next()-driven one does.
 looping = {'n': 0}
 
 
 def raise_on_second():
     looping['n'] += 1
     if looping['n'] == 2:
-        raise ValueError('inside the loop')
-    return looping['n']
+        raise ValueError('kaboom')
+    return looping['n'] if looping['n'] < 6 else 0
 
 
+loop_iter = iter(raise_on_second, 0)
 collected = []
+handled = False
 try:
-    for value in iter(raise_on_second, 0):
+    for value in loop_iter:
         collected.append(value)
     assert False, 'expected the for loop to propagate ValueError'
 except ValueError as exc:
-    assert str(exc) == 'inside the loop', 'the callable exception propagates out of the for loop'
+    handled = True
+    assert str(exc) == 'kaboom', 'the callable exception propagates out of the for loop'
+    assert exc.args == ('kaboom',), 'the exception arguments survive the loop unchanged'
+assert handled, 'the handler enclosing the for loop must run'
 assert collected == [1], 'values yielded before the exception are unaffected'
 assert looping['n'] == 2, 'the loop made exactly one call per step'
+assert next(loop_iter) == 3, 'a for-driven exception does not exhaust the iterator either'
+assert looping['n'] == 3, 'the step after the loop is a single further call'
+for value in loop_iter:
+    collected.append(value)
+assert collected == [1, 4, 5], 'the same iterator keeps driving in a later for loop, up to the sentinel'
+assert looping['n'] == 6, 'the second loop yielded two values plus one sentinel probe'
+
+# An exception on the very FIRST step of a for loop is the sharpest form of the same guarantee:
+# nothing inside the try has run yet, so the loop statement itself is the only thing that can have
+# recorded where execution is. The next() call below deliberately pins the last recorded position
+# outside the try, so if the loop fails to record its own position around the nested call, the
+# handler search starts from that outside offset and this ValueError escapes uncaught.
+sharp = {'n': 0}
+
+
+def raise_at_once():
+    sharp['n'] += 1
+    raise ValueError('first step')
+
+
+sharp_iter = iter(raise_at_once, 0)
+pinned = next(iter(int, 5))
+assert pinned == 0, 'the position-pinning call sits outside the try below'
+caught_sharp = False
+try:
+    for value in sharp_iter:
+        assert False, 'the callable raises before any value can be yielded'
+except ValueError as exc:
+    caught_sharp = True
+    assert str(exc) == 'first step', 'the first-step exception reaches the handler unchanged'
+assert caught_sharp, 'the handler must run for an exception raised on the first step of a for loop'
+assert sharp['n'] == 1, 'exactly one call was made before the exception'
 
 # An error raised by the sentinel comparison itself behaves the same way: it propagates and leaves
 # the iterator live, because exhaustion is recorded only when a value really did equal the sentinel.
@@ -309,12 +351,22 @@ assert [v for v in iter(build_tuple, (0, 0))] == [(1,)], 'a tuple sentinel built
 assert tupled['n'] == 2, 'one yielded value plus one sentinel probe'
 
 # === Callable kinds and the non-callable diagnostic ===
-# Builtin types are callable values, so they are legitimate first arguments.
+# The eager check accepts exactly what the interpreter can call, and every kind reachable from
+# Python source is driven somewhere in this file: a plain function (the drive-until-sentinel and
+# exception sections), a function carrying defaults (the `grow` section), a closure (the reader in
+# the while/next section), a lambda and a builtin type (here). Two accepted kinds are deliberately
+# NOT covered, because neither is expressible in a test case rather than because they are untested
+# by oversight: module functions are not first-class values in monty at all (`os.getcwd` raises
+# AttributeError before `iter()` could ever see it), and external functions are accepted by the
+# check yet cannot complete a call from inside an iterator advance - a limitation inherited
+# verbatim from map(), filter() and sorted(), and out of scope for this feature.
 assert [v for v in iter(int, 0)] == [], 'int() produces 0, which equals the sentinel immediately'
 assert [v for v in iter(list, [])] == [], 'list() produces [], which equals the sentinel immediately'
 assert [v for v in iter(dict, {})] == [], 'dict() produces {}, which equals the sentinel immediately'
 assert next(iter(int, 5)) == 0, 'a builtin type whose result is not the sentinel yields that result'
 assert [v for v in iter(lambda: 7, 7)] == [], 'a lambda is callable'
+builtin_function_iter = iter(len, 5)
+assert iter(builtin_function_iter) is builtin_function_iter, 'a builtin function is accepted as the callable'
 
 # A non-callable first argument is rejected eagerly, when the iterator is constructed, rather than
 # on the first step.
