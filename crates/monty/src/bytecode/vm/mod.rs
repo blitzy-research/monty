@@ -1231,8 +1231,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     // the loop constructs. This is what makes the two-argument
                     // `for v in iter(callable, sentinel)` idiom usable. Refcount-neutral: the value
                     // was popped, so pushing it back returns the same owned reference to the stack.
-                    if let Value::Ref(id) = &value
-                        && matches!(self.heap.get(*id), HeapData::Iter(_))
+                    if let Value::Ref(id) = value
+                        && matches!(self.heap.get(id), HeapData::Iter(_))
                     {
                         self.push(value);
                     } else {
