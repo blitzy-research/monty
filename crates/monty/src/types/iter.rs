@@ -308,7 +308,7 @@ impl MontyIter {
                     Ok(Some(value))
                 } else {
                     // Exhaustion is sticky, and is recorded ONLY for sentinel equality - the single
-                    // condition the step reports as `Ok(None)`. Every exception propagated via `?`
+                    // condition the step reports as `Ok(None)`. Every exception propagates via `?`
                     // and never reaches here, leaving the iterator live for the next call.
                     *done = true;
                     Ok(None)

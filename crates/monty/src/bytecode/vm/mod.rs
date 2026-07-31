@@ -1732,13 +1732,17 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Discards every frame above `depth`, releasing each frame's stack region as it goes.
     ///
-    /// A nested `run()` loop normally unwinds itself: an exception is routed through
-    /// `handle_exception`, which pops frames until it reaches the `should_return` boundary
-    /// [`VM::evaluate_function`] marked, so the depth is already restored when the `Err` surfaces.
-    /// The exceptions are the errors raised at an *instruction boundary* - `Heap::check_time` at the
-    /// top of the loop, and a handful of allocation checks inside opcode arms - which leave by `?`
-    /// without unwinding anything. Those hand back an `Err` with the callee frames still registered
-    /// and their locals and operands still stacked above the caller's.
+    /// A nested `run()` loop normally unwinds itself: `try_catch_sync!` and `catch_sync!` route an
+    /// exception through `handle_exception`, which pops frames until it reaches the `should_return`
+    /// boundary [`VM::evaluate_function`] marked, so the depth is already restored when the `Err`
+    /// surfaces. Any error that leaves the loop *without* that routing skips the unwinding with it,
+    /// and hands back an `Err` with the callee frames still registered and their locals and operands
+    /// still stacked above the caller's. Today that means the `Heap::check_time` at the top of the
+    /// loop plus the direct `?` and `return Err` exits inside opcode arms - the heap allocations in
+    /// `MakeFunction` and `MakeClosure`, the exception-type check in `CheckExcMatch`, the
+    /// internal-error guards - but treat that as illustrative rather than exhaustive: what defines
+    /// the set is the *shape*, so any arm added later that returns an error without going through
+    /// `catch_sync!` joins it.
     ///
     /// Any caller whose own cleanup addresses the operand stack *by position* after re-entering the
     /// interpreter must therefore restore the depth first. `Opcode::ForIter` is the only such site:

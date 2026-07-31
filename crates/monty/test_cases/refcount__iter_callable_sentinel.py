@@ -16,17 +16,20 @@
 # than orphaned, and each heap sentinel sitting back at its binding-only count
 # of 1 proves neither owned value leaked.
 #
-# Each section releases the iterator through a different path: the ForIter
-# exhaustion arm, a namespace rebind, and the eager callability check that
-# rejects both arguments before any pair tuple exists.
+# The three sections cover the release paths that this ownership model turns on:
+# normal ForIter exhaustion of an unbound temporary, an explicit rebind of a
+# retained iterator after repeated next() calls, and the eager callability check,
+# which rejects both arguments before any pair tuple or iterator exists and so
+# has no iterator to release at all.
 #
 # Lists are the heap-allocated values tracked here. Ints, string literals and
 # plain module-level functions are immediates: they are not heap entries and so
 # never appear in the reference counts.
 
 # === Released by the ForIter exhaustion arm ===
-# The iterator is deliberately never bound, so draining it in a for loop is the
-# only thing that can free it: ForIter pops the exhausted iterator and drops it.
+# The iterator is deliberately never bound, so the for loop is its only owner,
+# holding it on the operand stack; draining it to exhaustion is what releases it
+# here, because the ForIter exhaustion arm pops the iterator and drops it.
 # The stopping value is a freshly allocated list equal to - but not the same
 # object as - the sentinel, so the step has to drop it instead of yielding it.
 calls = [0]
@@ -48,10 +51,12 @@ assert collected == [1, 2], 'iteration stops on the equal-by-value sentinel with
 assert calls == [3], 'two yields plus one sentinel probe invoke the callable three times'
 
 # === Released by rebinding the name after a next() driven drive ===
-# next() advances the iterator through a different path than ForIter, and the
-# iterator has to be bound to be driven that way, so it is released by rebinding
-# the name to an immediate. A propagated exception must leave the iterator live,
-# and exhaustion must be sticky, so no further value is ever produced.
+# next() advances the iterator through a different path than ForIter, and needs
+# no binding to do it - next(iter(f, s)) is valid. The iterator is bound here so
+# that the same object can be advanced repeatedly, which is why releasing it
+# takes an explicit rebind of the name to an immediate. A propagated exception
+# must leave the iterator live, and exhaustion must be sticky, so no further
+# value is ever produced.
 attempts = [0]
 retained = ['retained']
 
@@ -77,10 +82,11 @@ assert next(probe, 'DEF') == 'DEF', 'exhaustion is sticky, so the default comes 
 assert attempts == [3], 'the callable is never invoked again once the sentinel has been seen'
 probe = None
 
-# === Released by the eager callability check ===
+# === Both arguments released by the eager callability check ===
 # A non-callable first argument is rejected before any pair tuple is allocated,
-# so init has to drop both arguments itself. A leak on that path would inflate
-# both counts below, and an over-free would panic under ref-count-panic.
+# so no iterator is ever built here and init has to drop both arguments itself.
+# A leak on that path would inflate both counts below, and an over-free would
+# panic under ref-count-panic.
 uncallable = [1, 2]
 dropped = ['dropped']
 
