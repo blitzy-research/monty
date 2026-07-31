@@ -10,13 +10,23 @@
 #     against the heap entry count - so an orphaned iterator, pair tuple or dropped produced value
 #     is a failure.
 #
-# Every exit path a step can take is represented below: a yielded value, a value equal to the
-# sentinel, an exception from the callable, exhaustion, and rejection at construction. Nothing here
-# crosses the collector's allocation interval, deliberately: sweeping the empty tuple singleton
-# shifts `Heap::entry_count`, whose `skip(1)` assumes that singleton is the first live entry, so
-# strict matching cannot hold for any program that collects. Collection behaviour is covered by
-# `iter__callable_sentinel_gc.py` and by the Rust tests in `tests/resource_limits.rs`, which read
-# `allocations_since_gc` directly and can therefore prove a collection actually ran.
+# The step's exit paths are covered below: a yielded value, a value equal to the sentinel, an
+# exception from the callable, exhaustion, and rejection at construction. Two paths deliberately
+# live elsewhere, both because this file cannot express them:
+#   * A collection reached part-way through a step. The collector roots only the timezone-UTC
+#     singleton on top of the values it is handed, so an unreferenced empty tuple singleton is
+#     swept like any other entry - and `Heap::entry_count` skips the first *live* entry on the
+#     assumption that the singleton is still it, so the count comes back one short and strict
+#     matching cannot hold for any program that collects. `iter__callable_sentinel_gc.py` allocates
+#     past the collector's interval inside a single step and asserts the observable outcome instead.
+#   * A sentinel comparison that itself raises. `py_eq` can only fail by exceeding the recursion
+#     limit, and this file runs under two different limits: 50 on the ordinary path and 1000 through
+#     `run_ref_counts`, whose tracker documents that 1000 overflows the native stack in debug
+#     builds. No single nesting depth trips both, and measuring the limit from Python needs a
+#     `RecursionError` caught inside the recursing frame, which orphans a heap entry of its own and
+#     so breaks strict matching regardless. `iter__callable_sentinel.py` covers that path's
+#     behaviour, and the guards it relies on are the same ones the sentinel-stop and callable-error
+#     sections below already prove release their values.
 
 # === Normal yield and sentinel stop ===
 # Two heap values are yielded and a third, equal to the sentinel by value, is produced and dropped.

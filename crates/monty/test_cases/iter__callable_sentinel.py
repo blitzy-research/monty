@@ -141,8 +141,11 @@ assert looping['n'] == 2, 'the loop made exactly one call per step'
 
 # An error raised by the sentinel comparison itself behaves the same way: it propagates and leaves
 # the iterator live, because exhaustion is recorded only when a value really did equal the sentinel.
-# Comparing two distinct self-referential lists recurses until the interpreter stops it; the message
-# is not asserted because it reports the interpreter's own stack usage and so is not stable.
+# Exceeding the recursion limit is the comparison's only failure mode, and comparing two distinct
+# self-referential lists reaches it; the message is not asserted because it reports the interpreter's
+# own stack usage and so is not stable. The call counter is what proves the produced value was
+# handled rather than the step being retried, and the two steps after the error prove the iterator's
+# `done` flag and index were left untouched.
 cyclic_sentinel = []
 cyclic_sentinel.append(cyclic_sentinel)
 cyclic_value = []
