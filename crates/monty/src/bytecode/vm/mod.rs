@@ -590,6 +590,23 @@ pub struct VM<'h, 'a, T: ResourceTracker> {
     /// across multiple `json.loads()` calls within a single execution. Lazily
     /// initialized on first use, cleaned up when the VM is dropped.
     pub(crate) json_string_cache: JsonStringCache,
+
+    /// Nesting depth of runtime-Rust re-entries that must not be interrupted by a collection.
+    ///
+    /// Zero means collection is enabled; any positive value means a nested [`VM::run`] loop is
+    /// executing underneath runtime Rust that owns heap values in **Rust locals**. [`VM::run_gc`]
+    /// builds its root set from the operand stack, the globals, the exception stack and the JSON
+    /// cache, and `Heap::collect_garbage` frees every entry the mark phase cannot reach - it
+    /// consults neither reference counts nor active `HeapRead` reader counts - so a value reachable
+    /// only from the Rust call stack would be swept while still in use. Rooting cannot fix that in
+    /// general, because a Rust local in another module cannot be enumerated, which is why the depth
+    /// exists at all rather than a root registry.
+    ///
+    /// Managed **exclusively** through [`VM::with_gc_paused`], whose closure form is what keeps the
+    /// depth balanced across `?`. The invariant is therefore that it is **zero at every instruction
+    /// boundary of the outermost run loop**, which is also why `VMSnapshot` carries no counterpart:
+    /// a snapshot can only be taken where execution suspends, and a paused region cannot suspend.
+    gc_pause_depth: u32,
 }
 
 impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
@@ -613,6 +630,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
             json_string_cache: JsonStringCache::default(),
+            gc_pause_depth: 0,
         }
     }
 
@@ -675,6 +693,9 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             module_code: Some(module_code),
             ext_function_load_ip: None,
             json_string_cache: JsonStringCache::default(),
+            // A snapshot can only be taken where execution suspends, and a paused region cannot
+            // suspend, so a restored VM always starts with collection enabled.
+            gc_pause_depth: 0,
         }
     }
 
@@ -1744,7 +1765,17 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// Runs garbage collection with proper GC roots.
     ///
     /// GC roots include values in the stack (locals + operands), globals, and exception stack.
+    ///
+    /// Does nothing while collection is suspended by [`VM::with_gc_paused`]. The check lives here,
+    /// at the single entry point to collection, so no present or future caller can bypass the
+    /// suspension. Skipping loses nothing: only `Heap::collect_garbage` clears `allocations_since_gc`
+    /// and `may_have_cycles`, so a collection that is due stays due and runs at the first instruction
+    /// boundary reached with no suspension active.
     fn run_gc(&mut self) {
+        if self.gc_pause_depth > 0 {
+            return;
+        }
+
         // Collect roots from all reachable values
         let stack_roots = self.stack.iter().filter_map(Value::ref_id);
         let globals_roots = self.globals.iter().filter_map(Value::ref_id);
@@ -1759,6 +1790,60 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             .collect();
 
         self.heap.collect_garbage(roots);
+    }
+
+    /// Runs `f` with garbage collection suspended.
+    ///
+    /// Wrap a re-entry into the interpreter in this guard whenever runtime Rust holds heap values
+    /// the collector cannot see. [`VM::run_gc`] builds its root set from the operand stack, the
+    /// globals, the exception stack and the JSON cache, and `Heap::collect_garbage` frees every entry
+    /// the mark phase cannot reach - it ignores reference counts and active `HeapRead` reader counts
+    /// alike. Anything reachable only from the **Rust call stack** is therefore invisible to it, and
+    /// in general nothing can be published as a root on its behalf: a Rust local in another module
+    /// cannot be enumerated, and a `HeapRead` does not even carry the `HeapId` of the entry it points
+    /// at. Suspending collection for the duration of the nested run is what closes that window, which
+    /// is why this exists rather than a root registry.
+    ///
+    /// The one caller today is `types::iter`'s callable-driven iterator step - the two-argument
+    /// `iter(callable, sentinel)` form, and the only iterator advance in the interpreter that
+    /// re-enters the VM. It needs the iterator entry itself to survive, because it writes its step
+    /// state back through that entry after the nested run returns while `next(iter(f, s))` owns the
+    /// entry only through an argument list that was popped before the builtin ran. The same
+    /// protection covers whatever the *enclosing* runtime-Rust frame is accumulating, such as the
+    /// temporary `Set` that `types::dict_view::collect_iterable_to_set` fills while driving that
+    /// iterator from a pure-Rust loop - a graph this module could not root even if it wanted to.
+    ///
+    /// Suspension is not cancellation, and it does not reset the collector's scheduling state.
+    /// `Heap::should_gc` is `may_have_cycles && allocations_since_gc >= GC_INTERVAL` and only
+    /// `Heap::collect_garbage` clears either field, so the pause touches neither while allocations
+    /// made by the nested run keep moving them exactly as usual. A collection that was due stays due;
+    /// one that first becomes due inside the guarded region is simply serviced later.
+    ///
+    /// "Later" is the next **instruction boundary of a run loop with no suspension active**, which is
+    /// the only place [`VM::run_gc`] is reached and the only place where no runtime-Rust locals are in
+    /// play. That is not necessarily the instant this call returns: a runtime-Rust loop that re-enters
+    /// the interpreter several times within one instruction - as a dict-view operator driving an
+    /// iterator does - postpones the collection across all of those re-entries, which is exactly the
+    /// interval over which its accumulating locals need protecting. Resource accounting is untouched
+    /// either way: allocation, memory and time limits are enforced by the `ResourceTracker`, not by
+    /// the collector, so a runaway callable still trips them.
+    ///
+    /// # Foot-guns
+    ///
+    /// - Scope it as tightly as the nested call. Holding the suspension longer than necessary lets
+    ///   unreachable cycles accumulate, which under a memory-limited `ResourceTracker` surfaces as a
+    ///   spurious allocation failure rather than a collection.
+    /// - It suspends *tracing* collection only and has no effect on reference counting, so it is not
+    ///   a substitute for a missing `drop_with_heap`, and it protects against the collector rather
+    ///   than against `dec_ref`: the caller must still hold a reference count on anything it needs to
+    ///   stay alive.
+    /// - Balance is structural, not a convention: the depth is decremented after `f` returns, so an
+    ///   early `?` inside `f` cannot leak a suspension. Do not open-code the increment and decrement.
+    pub(crate) fn with_gc_paused<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.gc_pause_depth += 1;
+        let result = f(self);
+        self.gc_pause_depth -= 1;
+        result
     }
 
     /// Returns the current source position for traceback generation.

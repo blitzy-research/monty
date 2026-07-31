@@ -13,12 +13,13 @@
 # The step's exit paths are covered below: a yielded value, a value equal to the sentinel, an
 # exception from the callable, exhaustion, and rejection at construction. Two paths deliberately
 # live elsewhere, both because this file cannot express them:
-#   * A collection reached part-way through a step. The collector roots only the timezone-UTC
-#     singleton on top of the values it is handed, so an unreferenced empty tuple singleton is
-#     swept like any other entry - and `Heap::entry_count` skips the first *live* entry on the
-#     assumption that the singleton is still it, so the count comes back one short and strict
-#     matching cannot hold for any program that collects. `iter__callable_sentinel_gc.py` allocates
-#     past the collector's interval inside a single step and asserts the observable outcome instead.
+#   * A step that allocates past the collector's interval. The step suspends collection while it
+#     runs, so the collection it made due happens at the first instruction boundary outside it - but
+#     a collection anywhere defeats strict matching here, because the collector roots only the
+#     timezone-UTC singleton on top of the values it is handed, so an unreferenced empty tuple
+#     singleton is swept like any other entry while `Heap::entry_count` still skips the first *live*
+#     entry on the assumption that the singleton is it, leaving the count one short.
+#     `iter__callable_sentinel_gc.py` drives that path and asserts the observable outcome instead.
 #   * A sentinel comparison that itself raises. `py_eq` can only fail by exceeding the recursion
 #     limit, and this file runs under two different limits: 50 on the ordinary path and 1000 through
 #     `run_ref_counts`, whose tracker documents that 1000 overflows the native stack in debug

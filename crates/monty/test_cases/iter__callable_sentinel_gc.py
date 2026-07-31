@@ -1,11 +1,14 @@
 # === iter(callable, sentinel) survives garbage collection during an advance ===
 # Advancing a callable-driven iterator re-enters the interpreter, which makes it the only kind of
-# iterator whose advance can trigger a collection. The collector marks from the operand stack,
-# globals and the exception stack, so anything reachable only from the runtime's own call stack is
-# invisible to it - and `next()` pops its argument before running, so an iterator that is never
-# bound to a name, together with the callable and sentinel it owns, is exactly that. Every section
-# below deliberately allocates enough reference-holding containers inside the callable to make a
-# collection happen part-way through a step.
+# iterator whose advance can reach a collection point. The collector marks from the operand stack,
+# globals and the exception stack and frees everything else, consulting neither reference counts nor
+# active readers, so anything reachable only from the runtime's own call stack is invisible to it -
+# and `next()` pops its argument before running, so an iterator that is never bound to a name,
+# together with the callable and sentinel it owns, is exactly that. The step therefore suspends
+# collection for its duration; the deferred collection runs at the next instruction boundary outside
+# it. Every section below deliberately allocates enough reference-holding containers inside the
+# callable to make a collection due part-way through a step, so that removing the suspension turns
+# each one back into a use-after-free rather than a silent pass.
 
 # `calls` counts invocations so laziness can be asserted; `churn_on` selects which step allocates
 # heavily, so a collection can be forced on the first step or on a later one.
@@ -52,6 +55,14 @@ def int_or_stop():
     return state['calls'] if state['calls'] <= 3 else ['STOP']
 
 
+def text_stepper():
+    # Yields freshly built strings, so each value is a heap object that only the consumer's own
+    # accumulator references once it has been handed over. Used where the point is that those
+    # accumulated values survive a collection reached later in the same drive.
+    step()
+    return 'k' + str(state['calls']) if state['calls'] <= 5 else 'STOP'
+
+
 # === Unbound temporary iterator ===
 # Nothing on the operand stack references this iterator while its callable runs, so it is reachable
 # from the runtime's Rust locals alone.
@@ -83,15 +94,6 @@ assert state['calls'] == 3, 'an exhausted iterator never calls back'
 # both of its operands, so the iterator it is driving lives in a Rust local and nothing on the value
 # stack references it - and the sentinel it owns is a list that only the iterator references. Both
 # have to survive a collection reached part-way through the drive.
-#
-# The dict and its view are bound to names, and the callable yields plain integers, on purpose. What
-# the drive accumulates is a temporary `set` living in Rust, and a collection cannot see that
-# container's contents any more than it can see an operand a binary operator has already popped. That
-# gap is not specific to `iter(callable, sentinel)`: every builtin that holds heap values across a
-# call back into the interpreter shares it - `map`, `filter`, `sorted`, `min`, `max` and `list.sort`
-# included - and closing it needs a root registry that has to live with the collector rather than
-# with the iterator. This section therefore pins exactly what the iterator itself can guarantee: its
-# own entry, and through that entry its callable and its sentinel.
 counts = {1: 'x'}
 keys = counts.keys()
 state['calls'] = 0
@@ -100,6 +102,26 @@ assert sorted(keys | iter(int_or_stop, ['STOP'])) == [1, 2, 3], (
     'a dict-view union keeps driving a temporary iterator, and its heap sentinel, across a collection'
 )
 assert state['calls'] == 4, 'three yielded values plus one sentinel probe'
+
+# The same drive, but the yielded values are freshly built strings rather than plain integers, so the
+# temporary `set` the drive accumulates in Rust is itself full of heap objects that nothing else
+# references. Values handed to a consumer are the third graph a step has to protect, alongside the
+# iterator entry and the `next()` default, and this is the only one that lives in another module
+# entirely - which is why the step suspends collection rather than publishing roots: a set living in
+# the runtime's call stack cannot be enumerated from the iterator at all. Losing that protection is
+# not a leak but a use-after-free, so this assertion is load-bearing.
+#
+# The hazard is a property of the pattern rather than of this feature: every builtin that keeps heap
+# values in a runtime-Rust local across a call back into the interpreter shares it - `map`, `filter`,
+# `sorted`, `min`, `max` and `list.sort` included - and those paths are unchanged here.
+letters = {'z': 1}
+letter_keys = letters.keys()
+state['calls'] = 0
+state['churn_on'] = 3
+assert sorted(letter_keys | iter(text_stepper, 'STOP')) == ['k1', 'k2', 'k3', 'k4', 'k5', 'z'], (
+    'every heap value the drive already accumulated in Rust survives a collection mid-drive'
+)
+assert state['calls'] == 6, 'five yielded values plus one sentinel probe'
 
 # `isdisjoint` reaches the same advance path from a different caller; kept collection-free so the
 # fixture stays quick while still covering that entry point.
