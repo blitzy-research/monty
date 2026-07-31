@@ -1756,9 +1756,9 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     ///
     /// Does nothing while collection is suspended by [`VM::with_gc_paused`]. The check lives
     /// here, at the single entry point to collection, so the suspension cannot be bypassed by a
-    /// future caller. Nothing is lost by skipping: `Heap::should_gc` stays true (neither
-    /// `allocations_since_gc` nor `may_have_cycles` is reset), so the collection happens on the
-    /// next instruction executed once the suspension ends.
+    /// future caller. Nothing is lost by skipping: only `Heap::collect_garbage` clears
+    /// `allocations_since_gc` and `may_have_cycles`, so a due collection stays due and runs at the
+    /// first instruction boundary reached with no suspension active.
     fn run_gc(&mut self) {
         if self.gc_pause_depth > 0 {
             return;
@@ -1798,12 +1798,21 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// accumulating, such as the temporary `Set` a dict-view operator fills while driving that
     /// iterator.
     ///
-    /// Suspension is not cancellation: `Heap::should_gc` remains true throughout, so the pending
-    /// collection runs on the next instruction executed after the suspension ends. Postponement
-    /// is therefore bounded by the duration of the nested call, and it resumes exactly where it
-    /// is safe again — an instruction boundary with no runtime-Rust locals in play. Resource
-    /// accounting is untouched: allocation, memory and time limits are enforced by the
-    /// `ResourceTracker`, not by the collector, so a runaway callable still trips them.
+    /// Suspension is not cancellation, and it does not reset the collector's scheduling state.
+    /// `Heap::should_gc` is `may_have_cycles && allocations_since_gc >= GC_INTERVAL` and only
+    /// `Heap::collect_garbage` clears either field, so the pause touches neither while allocations
+    /// made by the nested run keep moving them exactly as usual. A collection that was due stays
+    /// due; one that first becomes due inside the guarded region is simply serviced later.
+    ///
+    /// "Later" is the next **instruction boundary of the run loop**, which is the only place
+    /// [`VM::run_gc`] is reached and the only place where no runtime-Rust locals are in play. That
+    /// is not necessarily the instant this call returns: only the guard's lifetime is bounded to the
+    /// nested call, so a runtime-Rust loop that re-enters the interpreter several times within one
+    /// instruction — as a dict-view operator driving an iterator does — postpones the collection
+    /// across all of those re-entries, which is exactly the interval over which its accumulating
+    /// locals need protecting. Resource accounting is untouched either way: allocation, memory and
+    /// time limits are enforced by the `ResourceTracker`, not by the collector, so a runaway
+    /// callable still trips them.
     ///
     /// # Foot-guns
     ///

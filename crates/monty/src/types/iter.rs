@@ -64,7 +64,13 @@ pub struct MontyIter {
     index: usize,
     /// Type-specific iteration data.
     iter_value: IterValue,
-    /// the actual Value being iterated over.
+    /// The owned value this iterator keeps alive, retained for garbage-collection traversal and
+    /// reference counting rather than for iteration itself.
+    ///
+    /// It is **not** necessarily the object being iterated: `Value::None` for the variants that
+    /// copy their state out (`Range`, `IterStr`), the iterated container for `HeapRef`, and the
+    /// `[callable, sentinel]` pair tuple for `CallableSentinel`. See the foot-gun on the struct
+    /// above for why.
     value: Value,
 }
 
@@ -211,13 +217,22 @@ impl MontyIter {
     ///
     /// # Foot-guns
     ///
-    /// - Nothing fallible may be inserted between `allocate` succeeding and the move-in. From that
-    ///   point the iterator is the only owner of the pair reference and nothing on the operand
-    ///   stack references the iterator, so an early return there would strand both entries.
-    /// - `Heap::mark_potential_cycle` is **mandatory**: `Heap::allocate` only raises
-    ///   `may_have_cycles` when the data it is handed already holds references, and the
-    ///   reference-free iterator does not. `Heap::should_gc` gates *all* collection on that flag,
-    ///   so skipping the call would silently withhold this graph from the collector.
+    /// - Nothing fallible may be inserted between `allocate` succeeding and the move-in. Across that
+    ///   gap the pair reference is owned by the `pair_value` local *alone* - the freshly allocated
+    ///   iterator still holds `Value::None` - while nothing on the operand stack references the new
+    ///   iterator entry. An early return there would therefore destroy `pair_value` with ordinary
+    ///   Rust destruction, which has no heap access and so cannot release the pair sub-graph, and
+    ///   would simultaneously strand an iterator entry whose reference count no owner will ever
+    ///   decrement.
+    /// - `Heap::mark_potential_cycle` re-establishes, after the move-in, the cycle metadata
+    ///   `Heap::allocate` maintains for reference-holding data: that function raises
+    ///   `may_have_cycles` only when the data it is handed already holds references, and the
+    ///   reference-free iterator does not. The call is **conservative** rather than load-bearing -
+    ///   a pair that holds references already raised the flag during its own allocation, and a
+    ///   reference-free pair has no outgoing edge at all, so the iterator-to-pair edge cannot close
+    ///   a cycle either way. Keep it regardless: `Heap::should_gc` gates *all* collection on that
+    ///   flag, so holding the mutation and the metadata in step is what stops a future change here
+    ///   from silently withholding this graph from the collector.
     fn allocate_callable_sentinel(pair_value: Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
         let Some(pair) = pair_value.ref_id() else {
             panic!("iter(callable, sentinel): allocate_tuple must return a reference for a two-element pair")
@@ -252,8 +267,9 @@ impl MontyIter {
         // Release the reader count before handing the reference out, so the caller sees an entry
         // with no outstanding readers.
         drop(entry);
-        // This entry now holds a reference even though it was allocated without one, so raise the
-        // cycle flag `Heap::allocate` would have raised for it. See the foot-gun above.
+        // This entry now holds a reference even though it was allocated without one, so re-establish
+        // the cycle metadata `Heap::allocate` maintains for reference-holding data. Conservative
+        // rather than load-bearing - see the foot-gun above.
         vm.heap.mark_potential_cycle();
 
         Ok(Value::Ref(id))
@@ -305,9 +321,13 @@ impl MontyIter {
         matches!(self.value, Value::Ref(_))
     }
 
-    /// Returns a reference to the underlying value being iterated.
+    /// Returns the owned value this iterator keeps alive, for garbage-collection traversal.
     ///
-    /// Used by GC to traverse heap references held by the iterator.
+    /// This is the single edge `collect_child_ids` follows for `HeapData::Iter`, and it is the only
+    /// caller. It therefore returns whatever the variant needs traced rather than the iterated
+    /// object: `Value::None` for `Range` and `IterStr`, the iterated container for `HeapRef`, and
+    /// the `[callable, sentinel]` pair tuple for `CallableSentinel` — see the foot-gun on
+    /// [`MontyIter`].
     pub fn value(&self) -> &Value {
         &self.value
     }
@@ -571,9 +591,10 @@ impl<'h> HeapRead<'h, MontyIter> {
     ///   window by suspending collection for the whole step; see the foot-guns on that function
     ///   for why suspension rather than rooting is the mechanism.
     /// - The reader this `HeapRead` holds on the *iterator* entry may safely stay alive across the
-    ///   step: `dec_ref` only asserts on readers when it would actually free an entry, and both
-    ///   callers keep the iterator alive for the whole call (`ForIter` peeks rather than pops, and
-    ///   `iterator_next` holds it as the live argument).
+    ///   step: `dec_ref` only asserts on readers when it would actually free an entry, and every
+    ///   caller keeps the iterator alive for the whole call - `ForIter` peeks rather than pops,
+    ///   `iterator_next` holds it as the live argument, and `dict_view::collect_iterable_to_set`
+    ///   holds it in a `HeapGuard` around its drive loop.
     /// - `done` is written **only** on the `Ok(None)` path. An error propagates out via `?` before
     ///   step 3, so a raised exception leaves the iterator usable, matching CPython.
     fn advance_callable_sentinel(&mut self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
@@ -733,11 +754,21 @@ fn get_heap_item(
 /// `HeapId`, so the iterator's own id is not recoverable here without re-introducing a
 /// self-referential field, and no registry can enumerate an enclosing Rust frame's locals at all.
 ///
-/// Suspension is not cancellation. `Heap::should_gc` stays true throughout - neither
-/// `allocations_since_gc` nor `may_have_cycles` is touched - so the pending collection runs on the
-/// very next instruction executed after the step returns, and the postponement is bounded by one
-/// callable invocation. Resource accounting is unaffected: allocation, memory and time limits are
-/// all enforced by the tracker, not by the collector, so a runaway callable still trips them.
+/// Suspension is not cancellation, and it does not reset the collector's scheduling state.
+/// `Heap::should_gc` is `may_have_cycles && allocations_since_gc >= GC_INTERVAL`, and only
+/// `Heap::collect_garbage` clears either field: the pause itself touches neither, while allocations
+/// made by the nested run keep moving them exactly as usual - every GC-tracked allocation
+/// increments `allocations_since_gc`, and one whose data already holds references raises
+/// `may_have_cycles`. A collection that was already due therefore stays due, and one that first
+/// becomes due inside the step is merely serviced later.
+///
+/// "Later" means the next **VM instruction boundary**, where `should_gc` is consulted - not the
+/// moment this function returns. Only the *pause guard's lifetime* is bounded to a single step, so
+/// a runtime-Rust loop that advances the same iterator repeatedly inside one instruction - as
+/// `dict_view::collect_iterable_to_set` does - postpones the collection across all of those
+/// invocations. That is exactly the interval over which its accumulating `Set` needs protecting.
+/// Resource accounting is unaffected either way: allocation, memory and time limits are all
+/// enforced by the tracker, not by the collector, so a runaway callable still trips them.
 ///
 /// # Foot-guns
 ///
@@ -747,10 +778,15 @@ fn get_heap_item(
 /// - Keep the pause scoped to the step. Holding it longer lets unreachable cycles accumulate,
 ///   which under a memory-limited `ResourceTracker` surfaces as a spurious allocation failure
 ///   instead of a collection.
-/// - Errors from the callable and from the comparison propagate untouched via `?`, which is what
-///   makes exception transparency automatic. Consequently this function must **not** record
-///   exhaustion - the caller sets `done` only when `Ok(None)` is returned, so a propagated
-///   exception leaves the iterator live exactly as CPython does.
+/// - Both failure paths leave through `?` before any state is written, so this function must
+///   **not** record exhaustion: the caller sets `done` only when `Ok(None)` is returned, which is
+///   what leaves the iterator live after a raised exception, exactly as CPython does. The two paths
+///   are not equivalent, though. `VM::evaluate_function` already returns a `RunError`, so an
+///   exception from the **callable** propagates unchanged in type and message - that is what makes
+///   exception transparency automatic. `Value::py_eq` returns a `ResourceError`, so a failing
+///   **comparison** goes through `From<ResourceError> for RunError`, which also decides
+///   catchability: `Recursion` becomes a catchable `RecursionError`, while allocation, memory and
+///   time failures become uncatchable so untrusted code cannot suppress a limit violation.
 /// - External callables are rejected by `VM::evaluate_function` with an internal error
 ///   ("external functions are not yet supported in this context"). That limitation is inherited
 ///   verbatim from `map`, `filter` and `sorted` and is not addressed here.
