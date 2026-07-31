@@ -88,3 +88,28 @@ assert {'a': 1}.keys().isdisjoint(iter(name_stepper, 'STOP')) is True, (
     'isdisjoint drives the iterator through the same advance path'
 )
 assert state['calls'] == 3, 'two probed keys plus one sentinel probe'
+
+
+# === The default handed to next() survives too ===
+# When the terminal step is the one that collects, the value `next()` will return is a heap object
+# reachable only from the runtime's own locals for the duration of that step - so it has to survive
+# as well, and it has to come back as the very same object rather than a copy.
+def stop_stepper():
+    # Stops on its first call, so a temporary iterator's only step is the terminal one.
+    step()
+    return []
+
+
+state['calls'] = 0
+state['churn_on'] = 1
+assert next(iter(stop_stepper, []), ['FALLBACK']) == ['FALLBACK'], (
+    'a default built inline survives a collection during the terminal step'
+)
+assert state['calls'] == 1, 'the terminal step is a single call'
+
+state['calls'] = 0
+state['churn_on'] = 1
+holder = ['DEFAULT']
+assert next(iter(stop_stepper, []), holder) is holder, 'the exact default object is returned after a collection'
+assert holder == ['DEFAULT'], 'and it is handed back unchanged'
+assert state['calls'] == 1, 'the terminal step is still a single call'

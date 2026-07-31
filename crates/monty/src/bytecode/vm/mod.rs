@@ -1221,13 +1221,29 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                 // Iteration - route through exception handling
                 Opcode::GetIter => {
                     let value = self.pop();
-                    // Create a MontyIter from the value and store on heap
-                    match MontyIter::new(value, self) {
-                        Ok(iter) => match self.heap.allocate(HeapData::Iter(iter)) {
-                            Ok(heap_id) => self.push(Value::Ref(heap_id)),
-                            Err(e) => catch_sync!(self, cached_frame, e.into()),
-                        },
-                        Err(e) => catch_sync!(self, cached_frame, e),
+                    // An iterator is its own iterable: push it straight back instead of trying to
+                    // wrap it, mirroring both CPython's `PyObject_GetIter` (which returns self for
+                    // any iterator) and `MontyIter::init`'s one-argument self-return. Without this,
+                    // `for x in iter(obj)` and comprehensions over any iterator object raise
+                    // `TypeError: 'iterator' object is not iterable`, because
+                    // `IterValue::from_heap_data` deliberately does not handle `HeapData::Iter` -
+                    // teaching it to would change every `MontyIter::new` call site instead of only
+                    // the loop constructs. This is what makes the two-argument
+                    // `for v in iter(callable, sentinel)` idiom usable. Refcount-neutral: the value
+                    // was popped, so pushing it back returns the same owned reference to the stack.
+                    if let Value::Ref(id) = &value
+                        && matches!(self.heap.get(*id), HeapData::Iter(_))
+                    {
+                        self.push(value);
+                    } else {
+                        // Create a MontyIter from the value and store on heap
+                        match MontyIter::new(value, self) {
+                            Ok(iter) => match self.heap.allocate(HeapData::Iter(iter)) {
+                                Ok(heap_id) => self.push(Value::Ref(heap_id)),
+                                Err(e) => catch_sync!(self, cached_frame, e.into()),
+                            },
+                            Err(e) => catch_sync!(self, cached_frame, e),
+                        }
                     }
                 }
                 Opcode::ForIter => {
@@ -1240,7 +1256,23 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                         panic!("ForIter: expected iterator ref on stack");
                     };
 
-                    match iter.advance(self) {
+                    // Advancing a callable-driven `iter(callable, sentinel)` iterator re-enters the
+                    // interpreter, so `advance` can push a frame and run a nested `run()` loop -
+                    // something no other iterator can do. Sync the frame IP first, exactly as
+                    // `CallFunction` and `CallBuiltinFunction` below already do, because `pop_frame`
+                    // restores `instruction_ip` from the parent frame's `ip` when the nested frame
+                    // returns; a stale `ip` there would misdirect both the exception-table lookup
+                    // and traceback position reporting for the remainder of this instruction.
+                    self.current_frame_mut().ip = cached_frame.ip;
+                    // `pop_frame` overwrites `instruction_ip` itself, so save and restore it: the
+                    // error arm below resolves handlers and reports positions through
+                    // `instruction_ip`, which must keep pointing at this ForIter instruction rather
+                    // than at the byte after its operand.
+                    let instruction_ip = self.instruction_ip;
+                    let advanced = iter.advance(self);
+                    self.instruction_ip = instruction_ip;
+
+                    match advanced {
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
                             // Drop the HeapRead before dec_ref to release the reader count

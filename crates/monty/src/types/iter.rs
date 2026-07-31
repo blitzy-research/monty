@@ -97,9 +97,12 @@ impl MontyIter {
     ///   which cannot decrement the references inside it. `HeapData::Tuple` is immutable by
     ///   construction — `Tuple::new` and its `items` field are private to `types/tuple.rs` and
     ///   its `contains_refs` flag is fixed at creation — so a reference-free tuple cannot be
-    ///   allocated first and filled afterwards, and the alternative (a fallible allocation
-    ///   path that hands rejected data back with heap access) lives in the approval-gated
-    ///   `heap.rs`. This is therefore the same inherited behaviour as every other owned-value
+    ///   allocated first and filled afterwards. A pre-flight budget check is no answer either:
+    ///   `ResourceTracker::on_allocate` updates the very counters it checks, so probing would
+    ///   spend a second allocation from the caller's budget and make every two-argument
+    ///   `iter()` call cost one more than it does. The only clean alternative — a fallible
+    ///   allocation path that hands rejected data back with heap access — lives in the
+    ///   approval-gated `heap.rs`. This is therefore the same inherited behaviour as every other owned-value
     ///   allocation in the crate, including [`get_heap_item`]'s `DictItemsView` arm in this
     ///   module and the `enumerate`, `zip` and `divmod` builtins. The **iterator** allocation
     ///   that follows it does not share the limitation; see
