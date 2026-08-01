@@ -919,7 +919,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                 }
                 Opcode::StoreCell => {
                     let slot = fetch_u16!(cached_frame);
-                    self.store_cell(&cached_frame, slot);
+                    try_catch_sync!(self, cached_frame, self.store_cell(&cached_frame, slot));
                 }
                 // Binary Operations - route through exception handling for tracebacks
                 Opcode::BinaryAdd => try_catch_sync!(self, cached_frame, self.binary_add()),
@@ -1254,6 +1254,27 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     let HeapReadOutput::Iter(mut iter) = self.heap.read(heap_id) else {
                         panic!("ForIter: expected iterator ref on stack");
                     };
+                    // Pin the iterator with a second owned reference for the duration of the advance and
+                    // record the stack depth the cleanup arms below address by position.
+                    //
+                    // A callable-driven advance re-enters the interpreter, and an uncatchable or internal
+                    // error raised inside that nested `run()` reaches `handle_exception`, which routes it to
+                    // `unwind_for_traceback`. That unwinding pops frames *without* honouring the
+                    // `should_return` boundary `VM::evaluate_function` marks, so it destroys the frame
+                    // executing this instruction: `cleanup_frame_state` drains this frame's stack region,
+                    // which releases the iterator reference this arm is still reading through `HeapRead` and
+                    // removes the slot the arms below pop. Releasing the last reference to an entry with an
+                    // active reader aborts the process in `Heap::dec_ref`, and popping a slot that is gone
+                    // takes an unrelated value off the stack, so both hazards are real and both are the
+                    // caller's to close - `unwind_for_traceback` has no way to know a Rust frame is mid-read.
+                    //
+                    // The extra reference keeps the refcount above zero across that drain, turning the
+                    // release into a decrement, and `stack_len` tells the arms whether the slot they would
+                    // pop still exists. Pinning by *adding* a reference rather than taking the value off the
+                    // stack is load-bearing: the operand stack is a GC root, and an advance that allocates
+                    // (string, dict and range iterators all do) can collect an iterator that no root holds.
+                    let pin = self.peek().clone_with_heap(self);
+                    let stack_len = self.stack.len();
 
                     // Advancing a callable-driven `iter(callable, sentinel)` iterator re-enters the
                     // interpreter, so `advance` can push a frame and run a nested `run()` loop -
@@ -1261,9 +1282,9 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     // `CallFunction` and `CallBuiltinFunction` below do, so this instruction stays
                     // resumable from the frame a nested unwind or `pop_frame` restore observes.
                     self.current_frame_mut().ip = cached_frame.ip;
-                    // Both cleanup arms below pop the iterator *by stack position*, and the advance may
-                    // re-enter the interpreter, so the pre-call depth is captured for
-                    // `discard_frames_above` to restore.
+                    // Both cleanup arms below pop the iterator *by stack position* whenever its slot
+                    // survived, and the advance may re-enter the interpreter, so the pre-call depth is
+                    // captured for `discard_frames_above` to restore.
                     let frame_depth = self.frames.len();
                     let advanced = iter.advance(self);
                     // Drop the HeapRead before any dec_ref to release the reader count. No arm below
@@ -1283,8 +1304,25 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     // `jump_relative!` in the exhaustion arm overwrites `cached_frame.ip`, so neither
                     // side of the match can host it.
                     self.instruction_ip = cached_frame.ip;
+                    // Settle the pin before any arm addresses the stack: the reader is gone, so this is a
+                    // plain decrement while the slot survives, and the final release where a nested unwind
+                    // already drained it. `slot_intact` is read from the depth captured before the advance,
+                    // so it has to be computed here rather than inside an arm that already popped.
+                    let slot_intact = self.stack.len() == stack_len;
+                    pin.drop_with_heap(self);
 
                     match advanced {
+                        // Defence in depth: only an error can unwind this frame, so a successful advance
+                        // always leaves the slot in place. Report instead of pushing onto a released region
+                        // if that ever stops holding.
+                        Ok(value) if !slot_intact => {
+                            if let Some(value) = value {
+                                value.drop_with_heap(self);
+                            }
+                            return Err(RunError::internal(
+                                "ForIter: stack region released by a successful advance",
+                            ));
+                        }
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
                             // Iterator exhausted - pop it and jump to end
@@ -1293,9 +1331,14 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                             jump_relative!(cached_frame.ip, offset);
                         }
                         Err(e) => {
-                            // Error during iteration (e.g., dict size changed)
-                            let iter = self.pop();
-                            iter.drop_with_heap(self);
+                            // Error during iteration (e.g., dict size changed, or the callable raised).
+                            // A nested unwind that drained this frame's region already released the slot,
+                            // and the pin above released the iterator itself, so only the surviving-slot
+                            // case has anything left to pop.
+                            if slot_intact {
+                                let iter = self.pop();
+                                iter.drop_with_heap(self);
+                            }
                             catch_sync!(self, cached_frame, e);
                         }
                     }
@@ -2071,11 +2114,21 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// The cell `HeapId` is read from the frame's local variable slot on the stack
     /// (cells are stored as `Value::Ref(cell_id)` at known positions in the locals region).
     /// Returns a `NameError` if the cell value is undefined (free variable not bound).
+    ///
+    /// # Foot-gun: a wrong slot is reported, never panicked
+    ///
+    /// Reaching a slot that does not hold a cell means the scope analysis in `prepare.rs` and the
+    /// cells `Opcode::MakeClosure` captured disagree, which is a compiler bug rather than anything
+    /// the running program did. It is still *guest* source that gets us here, so it is surfaced as
+    /// an internal `RunError` - an ordinary interpreter failure the embedder can catch and report -
+    /// rather than a `panic!` that would abort the host process out from under a sandbox and print
+    /// an internal file path. Keep it that way: a host abort is never an acceptable answer to
+    /// untrusted input.
     fn load_cell(&mut self, cached_frame: &CachedFrame<'a>, slot: u16) -> RunResult<()> {
-        let cell_id = self.cell_id_from_local(cached_frame, slot);
+        let cell_id = self.cell_id_from_local(cached_frame, slot)?;
         let value = match self.heap.get(cell_id) {
             HeapData::Cell(c) => c.0.clone_with_heap(self),
-            _ => panic!("LoadCell: entry is not a Cell"),
+            _ => return Err(RunError::internal("LoadCell: entry is not a Cell")),
         };
 
         // Check for undefined value - raise NameError for unbound free variable
@@ -2091,11 +2144,15 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Extracts the cell `HeapId` from a local variable slot on the stack.
     ///
-    /// Cell variables are stored as `Value::Ref(cell_id)` in the frame's locals region.
-    fn cell_id_from_local(&self, cached_frame: &CachedFrame<'_>, slot: u16) -> HeapId {
+    /// Cell variables are stored as `Value::Ref(cell_id)` in the frame's locals region. A slot
+    /// holding anything else is reported as an internal error for the reason given on
+    /// [`Self::load_cell`]: the interpreter must fail as an interpreter, not abort its host.
+    fn cell_id_from_local(&self, cached_frame: &CachedFrame<'_>, slot: u16) -> RunResult<HeapId> {
         match &self.stack[cached_frame.stack_base + slot as usize] {
-            Value::Ref(cell_id) => *cell_id,
-            other => panic!("LoadCell/StoreCell: expected cell reference in local slot {slot}, found {other:?}"),
+            Value::Ref(cell_id) => Ok(*cell_id),
+            other => Err(RunError::internal(format!(
+                "LoadCell/StoreCell: expected cell reference in local slot {slot}, found {other:?}"
+            ))),
         }
     }
 
@@ -2110,18 +2167,22 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Pops the top of stack and stores it in a closure cell.
     ///
-    /// The cell `HeapId` is read from the frame's local variable slot on the stack.
-    fn store_cell(&mut self, cached_frame: &CachedFrame<'_>, slot: u16) {
+    /// The cell `HeapId` is read from the frame's local variable slot on the stack. A slot that does
+    /// not hold a cell is reported as an internal error for the reason given on
+    /// [`Self::load_cell`]; the `HeapGuard` releases the popped value on that path, so an error
+    /// leaks nothing.
+    fn store_cell(&mut self, cached_frame: &CachedFrame<'_>, slot: u16) -> RunResult<()> {
         let value = self.pop();
-        // The guard will clean up the new value if we panic, or the old value if we swap
+        // The guard will clean up the new value if we return early, or the old value if we swap
         let mut guard = HeapGuard::new(value, self);
         let (value, this) = guard.as_parts_mut();
 
-        let cell_id = this.cell_id_from_local(cached_frame, slot);
+        let cell_id = this.cell_id_from_local(cached_frame, slot)?;
         let HeapReadOutput::Cell(mut cell) = this.heap.read(cell_id) else {
-            panic!("StoreCell: entry is not a Cell")
+            return Err(RunError::internal("StoreCell: entry is not a Cell"));
         };
         mem::swap(&mut cell.get_mut(this.heap).0, value);
+        Ok(())
     }
 }
 

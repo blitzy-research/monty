@@ -2303,6 +2303,17 @@ fn collect_assigned_names_from_args(
 /// For each FunctionDef node, we recursively analyze its body to find what names it
 /// references. Any name that is in `our_locals` and referenced by the nested function
 /// (not as a local of the nested function) becomes a cell_var.
+///
+/// # Foot-gun: every expression a statement holds must be visited
+///
+/// A closure can be written in *any* expression position, so this traversal has to reach every
+/// expression a statement owns - not just its nested statement bodies. Missing one is not a missed
+/// optimisation: the captured local keeps its plain local slot, `Opcode::MakeClosure` then captures
+/// that slot's raw value as if it were a cell, and the callee's `Opcode::LoadCell` finds a
+/// non-cell entry. The set of positions visited here therefore has to stay in step with
+/// [`collect_referenced_names_from_node`], which decides the same question for implicit captures;
+/// the two are the second and third passes over the same body and any asymmetry between them is a
+/// bug. Insertion is idempotent, so visiting a position twice is harmless.
 fn collect_cell_vars_from_node(
     node: &ParseNode,
     our_locals: &AHashSet<String>,
@@ -2346,8 +2357,14 @@ fn collect_cell_vars_from_node(
                 }
             }
         }
-        // Recurse into control flow structures
-        Node::For { body, or_else, .. } => {
+        // Recurse into control flow structures. The header expression is visited as well as the
+        // nested bodies: `for v in iter(lambda: buf.pop(0), 0):`, `while (lambda: q.pop())():` and
+        // `if (lambda: flag[0])():` all create a closure that runs in the enclosing frame, so the
+        // names they capture need cells exactly as they would in an assignment.
+        Node::For {
+            iter, body, or_else, ..
+        } => {
+            collect_cell_vars_from_expr(iter, our_locals, cell_vars, interner);
             for n in body {
                 collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
@@ -2355,7 +2372,8 @@ fn collect_cell_vars_from_node(
                 collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
         }
-        Node::While { body, or_else, .. } => {
+        Node::While { test, body, or_else } => {
+            collect_cell_vars_from_expr(test, our_locals, cell_vars, interner);
             for n in body {
                 collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
@@ -2363,7 +2381,8 @@ fn collect_cell_vars_from_node(
                 collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
         }
-        Node::If { body, or_else, .. } => {
+        Node::If { test, body, or_else } => {
+            collect_cell_vars_from_expr(test, our_locals, cell_vars, interner);
             for n in body {
                 collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
@@ -2381,6 +2400,11 @@ fn collect_cell_vars_from_node(
                 collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
             }
             for handler in handlers {
+                // The exception-type expression is evaluated in this frame, so a closure inside it
+                // captures from this scope just like a handler body statement does.
+                if let Some(exc_type) = &handler.exc_type {
+                    collect_cell_vars_from_expr(exc_type, our_locals, cell_vars, interner);
+                }
                 for n in &handler.body {
                     collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
                 }
@@ -2390,6 +2414,17 @@ fn collect_cell_vars_from_node(
             }
             for n in finally {
                 collect_cell_vars_from_node(n, our_locals, cell_vars, interner);
+            }
+        }
+        // Statements whose whole payload is an expression, and which can therefore hold a closure
+        // just as readily as an assignment can.
+        Node::Raise(Some(expr)) => {
+            collect_cell_vars_from_expr(expr, our_locals, cell_vars, interner);
+        }
+        Node::Assert { test, msg } => {
+            collect_cell_vars_from_expr(test, our_locals, cell_vars, interner);
+            if let Some(msg) = msg {
+                collect_cell_vars_from_expr(msg, our_locals, cell_vars, interner);
             }
         }
         // Handle expressions that may contain lambdas
@@ -2424,7 +2459,10 @@ fn collect_cell_vars_from_node(
             collect_cell_vars_from_expr(object, our_locals, cell_vars, interner);
             collect_cell_vars_from_expr(value, our_locals, cell_vars, interner);
         }
-        // Other nodes don't contain nested function definitions or lambdas
+        // Everything left holds no expression at all - `pass`, a bare `return`/`raise`, `break`,
+        // `continue`, `global`, `nonlocal` and the import forms - so none of them can define a
+        // closure. Keep this arm in step with `collect_referenced_names_from_node`, which lists the
+        // same set explicitly.
         _ => {}
     }
 }

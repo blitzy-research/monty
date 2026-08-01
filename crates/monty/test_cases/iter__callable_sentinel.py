@@ -654,3 +654,105 @@ try:
     assert False, 'expected an iterable but non-callable first argument to fail'
 except TypeError as exc:
     assert str(exc) == 'iter(v, w): v must be callable', 'non-callable list first argument message'
+
+
+# === Inline capturing callables in statement-header positions ===
+# The canonical shape of this idiom writes the callable inline, inside a function, over
+# that function's own local - `for v in iter(lambda: buf.pop(0), 0):`. The callable runs
+# in a frame of its own while the captured local lives in the enclosing frame, so the two
+# must share one object: a mutation the callable performs has to be visible after the
+# loop, and a name rebound after the iterator was built has to be visible to the callable.
+# Each case below places the construction in a different statement position - a for
+# header, a while test, an if condition, an assert and a raise - because a statement's
+# header expression is evaluated in the enclosing frame exactly as its body is, and the
+# sections above only ever build inline callables at module scope.
+def drive_inline(first):
+    buffer = [first, first + 1, 0]
+    collected = []
+    for value in iter(lambda: buffer.pop(0), 0):
+        collected.append(value)
+    return (collected, buffer)
+
+
+assert drive_inline(1) == ([1, 2], []), 'an inline lambda in a for header drives over an enclosing local'
+
+
+def rebind_after_construction():
+    source = [1, 0]
+    stream = iter(lambda: source.pop(0), 0)
+    source = [7, 8, 0]
+    collected = []
+    for value in stream:
+        collected.append(value)
+    return (collected, source)
+
+
+assert rebind_after_construction() == ([7, 8], []), 'the inline callable reads the current binding, not a copy'
+
+
+def while_test_inline():
+    pulls = ['a', 'b', '']
+    seen = []
+    while next(iter(lambda: pulls.pop(0), ''), '') != '':
+        seen.append(len(pulls))
+    return (seen, pulls)
+
+
+assert while_test_inline() == ([2, 1], []), 'an inline lambda in a while test drives over an enclosing local'
+
+
+def if_condition_inline(probe):
+    box = [probe]
+    if next(iter(lambda: box.pop(0), 0), 'stopped') == probe:
+        return 'yielded'
+    return 'stopped'
+
+
+assert if_condition_inline(5) == 'yielded', 'an inline lambda in an if condition yields a non-sentinel value'
+assert if_condition_inline(0) == 'stopped', 'the same shape reports exhaustion when the first value is the sentinel'
+
+
+def assert_position_inline(probe):
+    box = [probe, 0]
+    assert next(iter(lambda: box.pop(0), 0)) == probe, 'the inline callable ran inside the assert'
+    return box
+
+
+assert assert_position_inline(3) == [0], 'an inline lambda in an assert drives over an enclosing local'
+
+
+def raise_position_inline():
+    payload = ['detail', 0]
+    try:
+        raise ValueError(next(iter(lambda: payload.pop(0), 0)))
+    except ValueError as exc:
+        return (str(exc), payload)
+
+
+assert raise_position_inline() == ('detail', [0]), 'an inline lambda in a raise drives over an enclosing local'
+
+
+def nested_headers():
+    queue = [1, 2, 0]
+    collected = []
+    while len(collected) < 2:
+        if len(queue) > 1:
+            for value in iter(lambda: queue.pop(0), 0):
+                collected.append(value)
+    return (collected, queue)
+
+
+assert nested_headers() == ([1, 2], []), 'header positions nest, so a for inside if inside while still captures'
+
+
+# A callback builtin in the same position captures the same way, so one control keeps the
+# two shapes honest about sharing a single mechanism rather than an iter-specific one.
+def sorted_key_inline(bias):
+    offsets = [bias]
+    ordered = []
+    for value in sorted([2, 1], key=lambda item: item + offsets[0]):
+        ordered.append(value)
+    return (ordered, offsets)
+
+
+assert sorted_key_inline(10) == ([1, 2], [10]), 'an inline capturing key in a for header orders correctly'

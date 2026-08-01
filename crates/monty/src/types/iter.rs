@@ -87,14 +87,15 @@ impl MontyIter {
     ///   to push a frame ("IP sync deferred to error path"). Do not pre-fetch a first value.
     /// - Callability is validated **eagerly**, matching CPython's `iter(v, w): v must be
     ///   callable`, so a bad first argument fails at construction rather than on first use.
-    /// - Inherited: an **inline** callable that captures a local of an enclosing *function* aborts
-    ///   when it is invoked. A lambda or nested `def` written inside a `for`-statement header or an
-    ///   `if` condition is compiled without the cell its capture needs, so `LoadCell: entry is not a
-    ///   Cell` panics on the first call and `for v in iter(lambda: buf.pop(0), 0):` inside a function
-    ///   never runs. The defect is in the compiler's cell allocation for closures created in those
-    ///   positions rather than here - untouched `sorted(key=...)` and `map()` abort identically with
-    ///   no `iter()` involved, and that is where it has to be fixed. Binding the callable to a name
-    ///   first is the working form, which is what the fixtures for this feature use throughout.
+    /// - An **inline** callable that captures a local of an enclosing *function* -
+    ///   `for v in iter(lambda: buf.pop(0), 0):` inside a `def` - works, and it is worth knowing why
+    ///   it once did not. A closure written in a statement *header* was compiled without the cell its
+    ///   capture needs, because the scope analysis that decides which locals become cells skipped
+    ///   every header expression, so the first call hit a non-cell slot. The fix belongs to that
+    ///   analysis, not here: `collect_cell_vars_from_node` in `prepare.rs` now visits header
+    ///   expressions exactly as it visits statement bodies, which also repaired the same shape in
+    ///   untouched `sorted(key=...)` and `map()`. The fixtures cover the inline form inside a
+    ///   function so it cannot regress silently.
     /// - The two-argument form owns **two** values while `collect_child_ids` follows only one edge
     ///   out of an iterator, so both are moved into a two-element `(callable, sentinel)` tuple whose
     ///   single owning reference becomes `value`; `iter_value` keeps a non-owning mirror of that id.
@@ -525,9 +526,18 @@ impl<'h> HeapRead<'h, MontyIter> {
     /// - **No heap borrow may be live across the step.** Anything taken from `get_mut`/`get` is
     ///   copied out and its window closed first; holding one would either fail to compile or alias
     ///   heap data across a nested interpreter run. The reader this `HeapRead` holds on the *iterator*
-    ///   entry is the exception and is safe: `dec_ref` only asserts on readers when it would actually
-    ///   free an entry, and every caller keeps the iterator alive for the whole advance, so a nested
-    ///   advance of the same entry simply takes its own reader and window.
+    ///   entry is the exception, because `dec_ref` only asserts on readers when it would actually free
+    ///   an entry, so a nested advance of the same entry simply takes its own reader and window.
+    /// - **The caller must own a reference that a nested unwind cannot release.** `dec_ref` aborting
+    ///   on an active reader turns "the iterator was freed mid-advance" into a process abort, and the
+    ///   step's nested run *can* free it: an uncatchable or internal error routes `handle_exception`
+    ///   into `unwind_for_traceback`, which pops frames without honouring the `should_return` boundary
+    ///   `VM::evaluate_function` marks and so drains the calling frame's stack region. A caller whose
+    ///   only reference lives in that region - a `for` loop's operand slot - must therefore hold a
+    ///   second owned reference across the advance, which `Opcode::ForIter` does; callers reached
+    ///   through a builtin (`next()`, the dict-view set operations) already own their argument and
+    ///   need nothing further. Reasoning "the iterator is pinned because the stack holds it" is the
+    ///   trap: the stack slot is exactly what the unwind releases.
     /// - **State read before the step describes the past, so `done` is re-read after it.** The step
     ///   runs arbitrary Python, which can advance *this very iterator* through a nested `next()`. If
     ///   that inner advance is the one that stops - on sentinel equality or on a callable-raised
