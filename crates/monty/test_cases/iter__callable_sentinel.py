@@ -254,6 +254,160 @@ union = {'a': 1}.keys() | iter(lambda: view_queue.pop(0), '')
 assert sorted(union) == ['a', 'b', 'c'], 'a dict-view set operator consumes a sentinel iterator'
 assert view_queue == [], 'the union drive consumed the whole queue including its sentinel'
 
+# === A callable-raised StopIteration reads as exhaustion ===
+# StopIteration is the one exception the callable can raise that does NOT reach the
+# caller: it is read as a second exhaustion signal, so the "call this until it stops"
+# shape ends a drive cleanly instead of raising out of it. Exhaustion reached that way
+# is indistinguishable from sentinel equality - it is sticky, and a later next() gets a
+# fresh StopIteration rather than the message the callable used.
+stopper_calls = [0]
+
+
+def value_then_stop():
+    stopper_calls[0] = stopper_calls[0] + 1
+    if stopper_calls[0] == 1:
+        return 'first'
+    raise StopIteration('carried message')
+
+
+it = iter(value_then_stop, 'never equal')
+assert next(it) == 'first', 'the step before the raise yields its value'
+assert next(it, 'DEFAULT') == 'DEFAULT', 'a callable-raised StopIteration is read as exhaustion'
+assert stopper_calls[0] == 2, 'the raising step is the last invocation of the callable'
+assert next(it, 'DEFAULT') == 'DEFAULT', 'that exhaustion is sticky, so the default comes back again'
+assert stopper_calls[0] == 2, 'an exhausted iterator never invokes the callable again'
+try:
+    next(it)
+    assert False, 'expected the exhausted iterator to raise StopIteration'
+except StopIteration as exc:
+    assert str(exc) == '', 'exhaustion raises a fresh StopIteration, not the message the callable used'
+assert stopper_calls[0] == 2, 'raising StopIteration again needed no further call'
+assert iter(it) is it, 'an exhausted callable-sentinel iterator is still self-iterable'
+result = []
+for value in it:
+    result.append(value)
+assert result == [], 'a for loop over the exhausted iterator yields nothing'
+assert stopper_calls[0] == 2, 'the for loop drive invoked the callable no further either'
+
+
+# A bare raise on the very first call ends the loop before anything is yielded.
+def stop_at_once():
+    raise StopIteration
+
+
+result = []
+for value in iter(stop_at_once, 0):
+    result.append(value)
+assert result == [], 'a callable that raises StopIteration immediately yields nothing'
+
+# The values produced before the raise are still yielded, through the for loop and
+# through the comprehension form.
+partial_queue = [1, 2]
+
+
+def drain_then_stop():
+    if partial_queue:
+        return partial_queue.pop(0)
+    raise StopIteration('drained')
+
+
+result = []
+for value in iter(drain_then_stop, 0):
+    result.append(value)
+assert result == [1, 2], 'the values produced before the raise are still yielded'
+
+comp_queue = ['a', 'b']
+
+
+def comp_then_stop():
+    if comp_queue:
+        return comp_queue.pop(0)
+    raise StopIteration
+
+
+assert [v for v in iter(comp_then_stop, 'zzz')] == ['a', 'b'], 'the comprehension form ends on the raise too'
+
+# The idiom this enables: a callable that forwards to an inner iterator, where the
+# inner next() is what raises once the inner iterator runs out.
+inner = iter([1, 2, 3])
+result = []
+for value in iter(lambda: next(inner), 99):
+    result.append(value)
+assert result == [1, 2, 3], 'a callable that forwards to next() drains the inner iterator'
+
+
+# The raise need not be lexically inside the callable: one that arrives from a helper
+# the callable called is read the same way, because what is inspected is the exception
+# that reaches the iterator, not where it was raised.
+def raise_stop():
+    raise StopIteration('from a helper')
+
+
+def call_helper():
+    return raise_stop()
+
+
+helper_it = iter(call_helper, 0)
+assert next(helper_it, 'DEFAULT') == 'DEFAULT', 'a StopIteration from a nested call also ends iteration'
+
+# Only StopIteration means exhaustion, so the two rules compose: a ValueError still
+# propagates and still leaves the iterator live, the value after it is yielded, and the
+# StopIteration after that is what finally stops the iterator.
+mixed_calls = [0]
+
+
+def boom_value_stop():
+    mixed_calls[0] = mixed_calls[0] + 1
+    if mixed_calls[0] == 1:
+        raise ValueError('boom')
+    if mixed_calls[0] == 2:
+        return 2
+    raise StopIteration('now done')
+
+
+it = iter(boom_value_stop, 'never equal')
+try:
+    next(it)
+    assert False, 'expected the callable to raise ValueError'
+except ValueError as exc:
+    assert str(exc) == 'boom', 'a non-StopIteration exception still propagates unchanged'
+assert next(it) == 2, 'the ValueError did not exhaust the iterator'
+assert next(it, 'DEF') == 'DEF', 'the StopIteration after it did exhaust the iterator'
+assert next(it, 'DEF') == 'DEF', 'and that exhaustion is sticky'
+assert mixed_calls[0] == 3, 'one invocation per step, and none once exhausted'
+
+# Sentinel equality is still tested first, so a callable that returns the sentinel
+# stops there and is never given the chance to raise.
+equal_calls = [0]
+
+
+def sentinel_then_stop():
+    equal_calls[0] = equal_calls[0] + 1
+    if equal_calls[0] == 1:
+        return 0
+    raise StopIteration('unreachable')
+
+
+result = []
+for value in iter(sentinel_then_stop, 0):
+    result.append(value)
+assert result == [], 'the sentinel stops iteration on the first step'
+assert equal_calls[0] == 1, 'the raise was never reached'
+
+# The dict-view set operators advance an iterator object directly, so the same
+# exhaustion signal ends the drive on that route as well.
+view_stop_queue = ['b', 'c']
+
+
+def view_then_stop():
+    if view_stop_queue:
+        return view_stop_queue.pop(0)
+    raise StopIteration
+
+
+union = {'a': 1}.keys() | iter(view_then_stop, 'zzz')
+assert sorted(union) == ['a', 'b', 'c'], 'a dict-view operator ends on a callable-raised StopIteration'
+
 # === Argument-count errors ===
 # iter takes one or two positional-only arguments; both bounds keep their
 # CPython messages.
@@ -388,6 +542,53 @@ assert nested_inner == [2], 'the recursive advance yielded its own value rather 
 assert nested_calls[0] == 2, 'the outer step and its recursive step account for both calls'
 assert next(it, 'DEF') == 3, 'the iterator keeps producing after a re-entrant advance that did not stop it'
 assert nested_calls[0] == 3, 'the following step invokes the callable exactly once more'
+
+# the same collision reached through the other stop condition: here the recursive advance
+# is stopped by a callable-raised StopIteration rather than by the sentinel, and it
+# outranks the in-flight value in exactly the same way
+raising_calls = [0]
+raising_holder = []
+raising_inner = []
+
+
+def raising_driver():
+    raising_calls[0] = raising_calls[0] + 1
+    if raising_calls[0] == 1:
+        raising_inner.append(next(raising_holder[0], 'INNER'))
+        return ['late']
+    raise StopIteration('inner raise')
+
+
+it = iter(raising_driver, 'never equal')
+raising_holder.append(it)
+assert next(it, 'OUTER') == 'OUTER', 'a re-entrant StopIteration stop also discards the in-flight value'
+assert raising_inner == ['INNER'], 'the recursive advance is the one whose step raised'
+assert raising_calls[0] == 2, 'the outer step plus its one recursive step invoke the callable twice'
+assert next(it, 'AFTER') == 'AFTER', 'that stop is as sticky as a re-entrant sentinel stop'
+assert raising_calls[0] == 2, 'no further call is made once the iterator has stopped'
+
+# and driven by a for loop, so the discarded value never reaches the loop variable
+raising_loop_calls = [0]
+raising_loop_holder = []
+raising_loop_inner = []
+
+
+def raising_loop_driver():
+    raising_loop_calls[0] = raising_loop_calls[0] + 1
+    if raising_loop_calls[0] == 1:
+        raising_loop_inner.append(next(raising_loop_holder[0], 'INNER'))
+        return ['late']
+    raise StopIteration
+
+
+it = iter(raising_loop_driver, 'never equal')
+raising_loop_holder.append(it)
+result = []
+for value in it:
+    result.append(value)
+assert result == [], 'the for loop yields nothing when a re-entrant raise already stopped the iterator'
+assert raising_loop_inner == ['INNER'], 'the recursive advance raised while the loop step was in flight'
+assert raising_loop_calls[0] == 2, 'the loop leaves the callable invoked exactly twice'
 
 # === Comprehension form ===
 comp_calls = [0]
