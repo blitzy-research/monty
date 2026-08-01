@@ -56,9 +56,8 @@ enum AwaitResult {
 
 /// Tries an operation and handles exceptions, reloading cached frame state.
 ///
-/// Use this in the main run loop where `cached_frame`
-/// are used. After catching an exception, reloads the cache since the handler
-/// may be in a different frame.
+/// Use this in the main run loop, where `cached_frame` is live. After catching an exception, reloads
+/// the cache because the handler may be in a different frame.
 macro_rules! try_catch_sync {
     ($self:expr, $cached_frame:ident, $expr:expr) => {
         if let Err(e) = $expr {
@@ -73,9 +72,8 @@ macro_rules! try_catch_sync {
 
 /// Handles an exception and reloads cached frame state if caught.
 ///
-/// Use this in the main run loop where `cached_frame`
-/// are used. After catching an exception, reloads the cache since the handler
-/// may be in a different frame.
+/// Use this in the main run loop, where `cached_frame` is live. After catching an exception, reloads
+/// the cache because the handler may be in a different frame.
 ///
 /// Wrapped in a block to allow use in match arm expressions.
 macro_rules! catch_sync {
@@ -133,8 +131,9 @@ macro_rules! fetch_i16 {
 
 /// Reloads cached frame state from the current frame.
 ///
-/// Call this after any operation that modifies the frame stack (calls, returns,
-/// exception handling).
+/// Call this whenever execution continues in a frame other than the one the cache was loaded from -
+/// a pushed frame, a caught exception whose handler is elsewhere. An operation that leaves the
+/// current frame unchanged, including a nested run loop that returns to it, needs no reload.
 macro_rules! reload_cache {
     ($self:expr, $cached_frame:ident) => {{
         $cached_frame = $self.new_cached_frame();
@@ -175,11 +174,11 @@ macro_rules! handle_load_result {
 /// Handles the result of a call operation that returns `CallResult`.
 ///
 /// This macro eliminates the repetitive pattern of matching on `CallResult`
-/// variants that appears in LoadAttr, CallFunction, CallFunctionKw, CallAttr,
-/// CallAttrKw, and CallFunctionExtended opcodes.
+/// variants that appears in the `LoadAttr`, `LoadAttrImport`, `CallFunction`, `CallFunctionKw`,
+/// `CallAttr`, `CallAttrKw`, `CallFunctionExtended` and `CallAttrExtended` opcodes.
 ///
 /// Actions taken for each variant:
-/// - `Push(value)`: Push the value onto the stack
+/// - `Value(value)`: Push the value onto the stack
 /// - `FramePushed`: Reload the cached frame (a new frame was pushed)
 /// - `External(ext_id, args)`: Return `FrameExit::ExternalCall` to yield to host
 /// - `OsCall(func, args)`: Return `FrameExit::OsCall` to yield to host
@@ -281,7 +280,7 @@ pub enum FrameExit {
     OsCall {
         /// ID of the os function to call.
         function: OsFunction,
-        /// Arguments for the external function (includes both positional and keyword args).
+        /// Arguments for the OS operation (includes both positional and keyword args).
         args: ArgValues,
         /// Unique ID for this call, used for async correlation.
         call_id: CallId,
@@ -516,12 +515,14 @@ pub struct VMSnapshot {
 /// The bytecode virtual machine.
 ///
 /// Executes compiled bytecode using a stack-based execution model.
-/// The instruction pointer (IP) lives in each `CallFrame`, not here,
-/// to avoid sync bugs on call/return.
+///
+/// Two instruction pointers exist and mean different things. Each `CallFrame` owns the *resumable*
+/// IP, so a call or return cannot lose a frame's position. [`VM::instruction_ip`] separately tracks
+/// the instruction currently being executed, for exception-handler lookup and position reporting.
 ///
 /// # Lifetimes
-/// * `'a` - Lifetime of the heap, namespaces, and interns
-/// * `'p` - Lifetime of the print writer's internal references
+/// * `'h` - Lifetime of the borrowed heap reader
+/// * `'a` - Lifetime of the interns, compiled code, and print writer
 pub struct VM<'h, 'a, T: ResourceTracker> {
     /// Operand stack — locals and operands interleaved per frame.
     ///
@@ -559,8 +560,11 @@ pub struct VM<'h, 'a, T: ResourceTracker> {
 
     /// IP of the instruction being executed (for exception table lookup).
     ///
-    /// Updated at the start of each instruction before operands are fetched.
-    /// This allows us to find the correct exception handler when an error occurs.
+    /// Normally set at the start of each instruction, before operands are fetched, so a handler
+    /// lookup or position report resolves against the instruction that raised. Paths that push a
+    /// frame are the exception: `pop_frame` re-points this at the parent frame's IP when the nested
+    /// frame returns, so an instruction that re-enters the interpreter mid-execution must restore it
+    /// before reading it again. Distinct from `CallFrame::ip`, which is where a frame resumes.
     instruction_ip: usize,
 
     /// Scheduler for task management and call ID allocation.
@@ -590,6 +594,20 @@ pub struct VM<'h, 'a, T: ResourceTracker> {
     /// across multiple `json.loads()` calls within a single execution. Lazily
     /// initialized on first use, cleaned up when the VM is dropped.
     pub(crate) json_string_cache: JsonStringCache,
+
+    /// Nesting depth of protected regions in which collection must not run.
+    ///
+    /// Zero means collection is enabled. A positive value means runtime Rust is inside a region that
+    /// owns heap values in **Rust locals**, which [`VM::run_gc`] cannot see: it roots the operand
+    /// stack, the globals, the exception stack and the JSON string cache, while `Heap::collect_garbage`
+    /// frees every entry the mark phase cannot reach, consulting neither reference counts nor active
+    /// `HeapRead` reader counts.
+    ///
+    /// Managed **exclusively** through [`VM::with_gc_paused`], which carries the guarantee this depth
+    /// provides and its limits. The depth is consequently zero at every instruction boundary of the
+    /// outermost run loop, which is why `VMSnapshot` has no counterpart field: execution can only
+    /// suspend where the depth is zero.
+    gc_pause_depth: u32,
 }
 
 impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
@@ -613,6 +631,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
             json_string_cache: JsonStringCache::default(),
+            gc_pause_depth: 0,
         }
     }
 
@@ -675,6 +694,9 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             module_code: Some(module_code),
             ext_function_load_ip: None,
             json_string_cache: JsonStringCache::default(),
+            // A snapshot can only be taken where execution suspends, and a paused region cannot
+            // suspend, so a restored VM always starts with collection enabled.
+            gc_pause_depth: 0,
         }
     }
 
@@ -752,8 +774,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// call is needed.
     ///
     /// Uses locally cached `code` and `ip` variables to avoid repeated
-    /// `frames.last_mut().expect()` calls during operand fetching. The cache
-    /// is reloaded after any operation that modifies the frame stack.
+    /// `frames.last_mut().expect()` calls during operand fetching. The cache must be reloaded
+    /// whenever execution continues in a frame other than the one it was loaded from.
     pub fn run(&mut self) -> Result<FrameExit, RunError> {
         // Cache frame state locally to avoid repeated frames.last_mut() calls.
         // The Code reference has lifetime 'a (lives in Interns), independent of frame borrow.
@@ -765,7 +787,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             self.heap.check_time()?;
 
             if self.heap.should_gc() {
-                // Sync IP before GC for safety
+                // Collection roots the stack, globals, exception stack and JSON cache - never frame
+                // state - so this write only keeps the frame's IP in step with the cache.
                 self.current_frame_mut().ip = cached_frame.ip;
                 self.run_gc();
             }
@@ -896,7 +919,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                 }
                 Opcode::StoreCell => {
                     let slot = fetch_u16!(cached_frame);
-                    self.store_cell(&cached_frame, slot);
+                    try_catch_sync!(self, cached_frame, self.store_cell(&cached_frame, slot));
                 }
                 // Binary Operations - route through exception handling for tracebacks
                 Opcode::BinaryAdd => try_catch_sync!(self, cached_frame, self.binary_add()),
@@ -1045,7 +1068,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                 }
                 // In-place Operations - route through exception handling
                 Opcode::InplaceAdd => try_catch_sync!(self, cached_frame, self.inplace_add()),
-                // Other in-place ops use the same logic as binary ops for now
+                // The remaining in-place opcodes delegate to their corresponding binary implementations.
                 Opcode::InplaceSub => try_catch_sync!(self, cached_frame, self.binary_sub()),
                 Opcode::InplaceMul => try_catch_sync!(self, cached_frame, self.binary_mult()),
                 Opcode::InplaceDiv => try_catch_sync!(self, cached_frame, self.binary_div()),
@@ -1207,41 +1230,115 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                 // Iteration - route through exception handling
                 Opcode::GetIter => {
                     let value = self.pop();
-                    // Create a MontyIter from the value and store on heap
-                    match MontyIter::new(value, self) {
-                        Ok(iter) => match self.heap.allocate(HeapData::Iter(iter)) {
-                            Ok(heap_id) => self.push(Value::Ref(heap_id)),
-                            Err(e) => catch_sync!(self, cached_frame, e.into()),
-                        },
-                        Err(e) => catch_sync!(self, cached_frame, e),
+                    // An iterator is its own iterable, so push it straight back rather than wrap it.
+                    // Refcount-neutral: `pop` and `push` move the same owned reference.
+                    if let Value::Ref(id) = value
+                        && matches!(self.heap.get(id), HeapData::Iter(_))
+                    {
+                        self.push(value);
+                    } else {
+                        match MontyIter::new(value, self) {
+                            Ok(iter) => match self.heap.allocate(HeapData::Iter(iter)) {
+                                Ok(heap_id) => self.push(Value::Ref(heap_id)),
+                                Err(e) => catch_sync!(self, cached_frame, e.into()),
+                            },
+                            Err(e) => catch_sync!(self, cached_frame, e),
+                        }
                     }
                 }
                 Opcode::ForIter => {
                     let offset = fetch_i16!(cached_frame);
-                    // Peek at the iterator on TOS and extract heap_id
                     let Value::Ref(heap_id) = *self.peek() else {
                         return Err(RunError::internal("ForIter: expected iterator ref on stack"));
                     };
                     let HeapReadOutput::Iter(mut iter) = self.heap.read(heap_id) else {
                         panic!("ForIter: expected iterator ref on stack");
                     };
+                    // Pin the iterator with a second owned reference for the duration of the advance and
+                    // record the stack depth the cleanup arms below address by position.
+                    //
+                    // A callable-driven advance re-enters the interpreter, and an uncatchable or internal
+                    // error raised inside that nested `run()` reaches `handle_exception`, which routes it to
+                    // `unwind_for_traceback`. That unwinding pops frames *without* honouring the
+                    // `should_return` boundary `VM::evaluate_function` marks, so it destroys the frame
+                    // executing this instruction: `cleanup_frame_state` drains this frame's stack region,
+                    // which releases the iterator reference this arm is still reading through `HeapRead` and
+                    // removes the slot the arms below pop. Releasing the last reference to an entry with an
+                    // active reader aborts the process in `Heap::dec_ref`, and popping a slot that is gone
+                    // takes an unrelated value off the stack, so both hazards are real and both are the
+                    // caller's to close - `unwind_for_traceback` has no way to know a Rust frame is mid-read.
+                    //
+                    // The extra reference keeps the refcount above zero across that drain, turning the
+                    // release into a decrement, and `stack_len` tells the arms whether the slot they would
+                    // pop still exists. Pinning by *adding* a reference rather than taking the value off the
+                    // stack is load-bearing: the operand stack is a GC root, and an advance that allocates
+                    // (string, dict and range iterators all do) can collect an iterator that no root holds.
+                    let pin = self.peek().clone_with_heap(self);
+                    let stack_len = self.stack.len();
 
-                    match iter.advance(self) {
+                    // Advancing a callable-driven `iter(callable, sentinel)` iterator re-enters the
+                    // interpreter, so `advance` can push a frame and run a nested `run()` loop -
+                    // something no other iterator can do. Sync the frame IP first, exactly as
+                    // `CallFunction` and `CallBuiltinFunction` below do, so this instruction stays
+                    // resumable from the frame a nested unwind or `pop_frame` restore observes.
+                    self.current_frame_mut().ip = cached_frame.ip;
+                    // Both cleanup arms below pop the iterator *by stack position* whenever its slot
+                    // survived, and the advance may re-enter the interpreter, so the pre-call depth is
+                    // captured for `discard_frames_above` to restore.
+                    let frame_depth = self.frames.len();
+                    let advanced = iter.advance(self);
+                    // Drop the HeapRead before any dec_ref to release the reader count. No arm below
+                    // needs it, and the frame cleanup that follows already releases heap values.
+                    drop(iter);
+                    // Defence in depth for the by-position pops below: an advance that returns with
+                    // callee frames still registered leaves their locals and operands stacked above the
+                    // iterator, which would corrupt those pops. A callable-driven advance re-enters the
+                    // VM inside `with_frame_state_restored`, so it hands back the depth already restored
+                    // and this finds nothing to discard.
+                    self.discard_frames_above(frame_depth);
+                    // Pin `instruction_ip` to the cached IP this arm reasons about. The advance already
+                    // restored the value the instruction started with, through the same shared guard;
+                    // this keeps the arm consistent with the IP it hands to `catch_sync!` below. It
+                    // sits between the advance and the `match` - which is why the result is bound to a
+                    // local first - because `catch_sync!` in the error arm reads `instruction_ip` while
+                    // `jump_relative!` in the exhaustion arm overwrites `cached_frame.ip`, so neither
+                    // side of the match can host it.
+                    self.instruction_ip = cached_frame.ip;
+                    // Settle the pin before any arm addresses the stack: the reader is gone, so this is a
+                    // plain decrement while the slot survives, and the final release where a nested unwind
+                    // already drained it. `slot_intact` is read from the depth captured before the advance,
+                    // so it has to be computed here rather than inside an arm that already popped.
+                    let slot_intact = self.stack.len() == stack_len;
+                    pin.drop_with_heap(self);
+
+                    match advanced {
+                        // Defence in depth: only an error can unwind this frame, so a successful advance
+                        // always leaves the slot in place. Report instead of pushing onto a released region
+                        // if that ever stops holding.
+                        Ok(value) if !slot_intact => {
+                            if let Some(value) = value {
+                                value.drop_with_heap(self);
+                            }
+                            return Err(RunError::internal(
+                                "ForIter: stack region released by a successful advance",
+                            ));
+                        }
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
-                            // Drop the HeapRead before dec_ref to release the reader count
-                            drop(iter);
                             // Iterator exhausted - pop it and jump to end
                             let iter = self.pop();
                             iter.drop_with_heap(self);
                             jump_relative!(cached_frame.ip, offset);
                         }
                         Err(e) => {
-                            // Drop the HeapRead before dec_ref to release the reader count
-                            drop(iter);
-                            // Error during iteration (e.g., dict size changed)
-                            let iter = self.pop();
-                            iter.drop_with_heap(self);
+                            // Error during iteration (e.g., dict size changed, or the callable raised).
+                            // A nested unwind that drained this frame's region already released the slot,
+                            // and the pin above released the iterator itself, so only the surviving-slot
+                            // case has anything left to pop.
+                            if slot_intact {
+                                let iter = self.pop();
+                                iter.drop_with_heap(self);
+                            }
                             catch_sync!(self, cached_frame, e);
                         }
                     }
@@ -1358,7 +1455,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     let func_id = FunctionId::from_index(func_idx);
 
                     if defaults_count == 0 {
-                        // No defaults - use inline Value::Function (no heap allocation)
+                        // No defaults - use inline Value::DefFunction (no heap allocation)
                         self.push(Value::DefFunction(func_id));
                     } else {
                         // Pop default values from stack (drain maintains order: first pushed = first in vec)
@@ -1481,8 +1578,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     }
                     // Pop current frame and push return value
                     if self.pop_frame() {
-                        // This frame indicated evaluation should stop - return to host with value
-                        // e.g. `evaluate_function`
+                        // This frame was marked `should_return`, so return from this run loop to its
+                        // caller (for example `evaluate_function`) rather than continuing to dispatch.
                         return Ok(FrameExit::Return(value));
                     }
                     self.push(value);
@@ -1678,6 +1775,74 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
         frame.should_return
     }
 
+    /// Runs `f` and hands its result back with the caller's frame state restored.
+    ///
+    /// Wrap a re-entry into the interpreter from runtime Rust in this guard whenever the value or
+    /// error `f` produces is handed back to a Python-visible operation. Re-entry can return with the
+    /// callee's frames still registered (see [`VM::discard_frames_above`] for why they survive) and
+    /// with `instruction_ip` pointing inside the callee, because `pop_frame` re-points it at every
+    /// parent it uncovers. Since `handle_exception` searches `self.frames.last()` at `instruction_ip`,
+    /// either one sends the *caller's* handler lookup into an abandoned frame and stops it at the
+    /// `should_return` boundary [`VM::evaluate_function`] marked, reporting a catchable exception as
+    /// unhandled.
+    ///
+    /// # The guarantee
+    ///
+    /// Whatever `f` returns - value or error - reaches the caller with `self.frames` truncated back
+    /// to its pre-call depth and `instruction_ip` back at the instruction that re-entered. The result
+    /// is passed through untouched, so an exception keeps its type, message and traceback exactly as
+    /// `f` produced them.
+    ///
+    /// # Caller obligations
+    ///
+    /// - Guard heap values separately: this restores *control* state only. Values `f` produced or held
+    ///   in Rust locals remain the caller's responsibility (`HeapGuard`/`defer_drop!`), and protecting
+    ///   them from collection is [`VM::with_gc_paused`]'s job.
+    /// - Wrap the **whole** nested region, error propagation included; the error path is exactly the
+    ///   one that needs the restored state.
+    /// - Synchronize a resumable `frame.ip` separately: this guard deliberately does not write it, so
+    ///   a caller that must leave its own frame resumable syncs it first, the way
+    ///   `Opcode::CallFunction`, `Opcode::CallBuiltinFunction` and `Opcode::ForIter` do.
+    pub(crate) fn with_frame_state_restored<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let depth = self.frames.len();
+        let instruction_ip = self.instruction_ip;
+        let result = f(self);
+        // Ordering is load-bearing: discarding pops through `pop_frame`, which rewrites
+        // `instruction_ip` for each parent it uncovers, so the restore has to follow it.
+        self.discard_frames_above(depth);
+        self.instruction_ip = instruction_ip;
+        result
+    }
+
+    /// Discards every frame above `depth`, releasing each frame's stack region as it goes.
+    ///
+    /// A nested `run()` loop normally unwinds itself: `try_catch_sync!` and `catch_sync!` route an
+    /// exception through `handle_exception`, which pops frames until it reaches the `should_return`
+    /// boundary [`VM::evaluate_function`] marked, so the depth is already restored when the `Err`
+    /// surfaces. An error that leaves the loop *without* that routing skips the unwinding with it, and
+    /// hands back an `Err` with the callee frames still registered and their locals and operands still
+    /// stacked above the caller's. The `Heap::check_time` at the top of the loop and the direct `?` and
+    /// `return Err` exits inside opcode arms are examples rather than the whole set - what defines it is
+    /// the *shape*, so any arm that returns an error without going through `catch_sync!` belongs to it.
+    ///
+    /// Every caller that re-enters the interpreter must therefore restore the depth before it either
+    /// addresses the operand stack *by position* or lets the error reach `handle_exception`, whose
+    /// handler lookup starts at the frame that is current when it runs. Wrapping the re-entry in
+    /// [`VM::with_frame_state_restored`] obtains that restoration for every consumer of the
+    /// re-entering operation rather than for one opcode arm.
+    ///
+    /// # Foot-gun
+    ///
+    /// The abandoned frames contribute no traceback entries, exactly as in `evaluate_function`'s own
+    /// cleanup - `unwind_for_traceback` is what attributes frames, and it never sees them. The error
+    /// therefore reports the position of the instruction that re-entered the interpreter, not the
+    /// position inside the callable.
+    fn discard_frames_above(&mut self, depth: usize) {
+        while self.frames.len() > depth {
+            self.pop_frame();
+        }
+    }
+
     fn cleanup_frame_state(&mut self, frame: &CallFrame<'_>) {
         // Clean up frame's stack region (locals + operands).
         // Locals occupy stack[frame.stack_base..frame.stack_base + frame.locals_count],
@@ -1696,8 +1861,9 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// Cleans up all frames and stack values for the current task.
     ///
     /// Used when a task completes or fails and we need to switch to another task.
-    /// Drains the stack with proper `drop_with_heap` for each value (since locals
-    /// are inlined on the stack), then cleans up each frame's cell references.
+    /// Draining the stack with `drop_with_heap` releases every value the task owned, including the
+    /// locals inlined on it and the cell objects those locals hold; the frames, which own no heap
+    /// values themselves, are then cleared.
     pub(super) fn cleanup_current_task(&mut self) {
         self.stack.drain(..).drop_with_heap(self.heap);
         self.frames.clear();
@@ -1705,8 +1871,21 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Runs garbage collection with proper GC roots.
     ///
-    /// GC roots include values in the stack (locals + operands), globals, and exception stack.
+    /// The roots handed over are the values in the stack (locals + operands), the globals, the
+    /// exception stack and the JSON string cache. `Heap::collect_garbage` additionally roots the
+    /// timezone-UTC singleton from inside itself, so callers neither pass nor need to know about it.
+    ///
+    /// Does nothing while collection is suspended by [`VM::with_gc_paused`]. The check lives here
+    /// because every VM-triggered collection goes through this method; `Heap::collect_garbage` is
+    /// reachable directly, so a collection site added later must repeat the check. Skipping is safe:
+    /// only `Heap::collect_garbage` clears `allocations_since_gc` and `may_have_cycles`, so a
+    /// collection that is due stays due until an instruction boundary is reached with the suspension
+    /// depth back at zero.
     fn run_gc(&mut self) {
+        if self.gc_pause_depth > 0 {
+            return;
+        }
+
         // Collect roots from all reachable values
         let stack_roots = self.stack.iter().filter_map(Value::ref_id);
         let globals_roots = self.globals.iter().filter_map(Value::ref_id);
@@ -1723,14 +1902,56 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
         self.heap.collect_garbage(roots);
     }
 
+    /// Runs `f` with garbage collection suspended.
+    ///
+    /// Wrap a re-entry into the interpreter in this guard when runtime Rust holds heap values the
+    /// collector cannot see. [`VM::run_gc`] roots only the operand stack, the globals, the exception
+    /// stack and the JSON string cache, and `Heap::collect_garbage` frees every entry the mark phase
+    /// cannot reach - neither reference counts nor active `HeapRead` reader counts protect it. Values
+    /// held only by the **Rust call stack** are therefore invisible to it, and an enclosing caller's
+    /// locals cannot be published as roots from the collection entry point: that would require a
+    /// registry every owner opts into, and none exists. Suspending collection covers them without one.
+    ///
+    /// # The guarantee, and its limits
+    ///
+    /// Collection is reached from exactly one place - the `should_gc` check at the top of the [`VM::run`]
+    /// dispatch loop - so it can only happen at an instruction boundary of a run loop. Suspending
+    /// across a re-entry therefore guarantees that nothing is swept between entering and leaving the
+    /// guarded region, however many times that region re-enters the interpreter.
+    ///
+    /// The guarantee covers the guarded region only, and tracing collection only. Other runtime-Rust
+    /// callers re-enter through `VM::evaluate_function` while holding heap values in Rust locals
+    /// *without* this suspension, so an unsuspended instruction boundary is not free of runtime-Rust
+    /// heap state in general. Resource accounting is unaffected in either case: allocation, memory and
+    /// time limits belong to the `ResourceTracker`, not the collector, so a runaway callable still
+    /// trips them.
+    ///
+    /// # Foot-guns
+    ///
+    /// - It suspends *tracing* collection only and has no effect on reference counting, so it is
+    ///   neither a substitute for a missing `drop_with_heap` nor protection against `dec_ref`: the
+    ///   caller must still hold a reference count on anything it needs to stay alive.
+    /// - Scope it as tightly as the nested call. Suspension defers a collection rather than cancelling
+    ///   it - `Heap::should_gc` keeps counting the allocations made inside - so holding it longer than
+    ///   necessary lets unreachable cycles accumulate, which under a memory-limited `ResourceTracker`
+    ///   surfaces as a spurious allocation failure instead of a collection.
+    /// - Balance is structural, not a convention: the depth is decremented after `f` returns, so an
+    ///   early `?` inside `f` cannot leak a suspension. Do not open-code the increment and decrement.
+    pub(crate) fn with_gc_paused<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.gc_pause_depth += 1;
+        let result = f(self);
+        self.gc_pause_depth -= 1;
+        result
+    }
+
     /// Returns the current source position for traceback generation.
     ///
-    /// Uses `instruction_ip` which is set at the start of each instruction in the run loop,
-    /// ensuring accurate position tracking even when using cached IP for bytecode fetching.
+    /// Resolves [`VM::instruction_ip`] rather than the frame's resumable IP, so the position reported
+    /// is the instruction that raised even though bytecode is fetched through a cached IP. Accuracy
+    /// therefore depends on any instruction that re-enters the interpreter restoring `instruction_ip`
+    /// before reporting, because `pop_frame` re-points it at the parent frame.
     pub(super) fn current_position(&self) -> CodeRange {
         let frame = self.current_frame();
-        // Use instruction_ip which points to the start of the current instruction
-        // (set at the beginning of each loop iteration in run())
         frame
             .code
             .location_for_offset(self.instruction_ip)
@@ -1778,7 +1999,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     ///
     /// Unlike `load_local`, this never yields `NameLookup`. When the variable is undefined
     /// (a `LocalUnassigned` name), it pushes `Value::ExtFunction(name_id)` so that the
-    /// subsequent `CallFunction` opcode can yield `FunctionCall` instead.
+    /// subsequent `CallFunction` opcode can yield `FrameExit::ExternalCall` instead.
     fn load_local_callable(&mut self, cached_frame: &CachedFrame<'a>, slot: u16, name_id: StringId) {
         let value = &self.stack[cached_frame.stack_base + slot as usize];
 
@@ -1795,7 +2016,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     ///
     /// Unlike `load_global`, this never yields `NameLookup`. When the variable is undefined,
     /// it pushes `Value::ExtFunction(name_id)` so that the subsequent `CallFunction` opcode
-    /// can yield `FunctionCall` instead.
+    /// can yield `FrameExit::ExternalCall` instead.
     fn load_global_callable(&mut self, slot: u16, name_id: StringId) {
         let value = self.globals[slot as usize].clone_with_heap(self);
 
@@ -1893,11 +2114,21 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// The cell `HeapId` is read from the frame's local variable slot on the stack
     /// (cells are stored as `Value::Ref(cell_id)` at known positions in the locals region).
     /// Returns a `NameError` if the cell value is undefined (free variable not bound).
+    ///
+    /// # Foot-gun: a wrong slot is reported, never panicked
+    ///
+    /// Reaching a slot that does not hold a cell means the scope analysis in `prepare.rs` and the
+    /// cells `Opcode::MakeClosure` captured disagree, which is a compiler bug rather than anything
+    /// the running program did. It is still *guest* source that gets us here, so it is surfaced as
+    /// an internal `RunError` - an ordinary interpreter failure the embedder can catch and report -
+    /// rather than a `panic!` that would abort the host process out from under a sandbox and print
+    /// an internal file path. Keep it that way: a host abort is never an acceptable answer to
+    /// untrusted input.
     fn load_cell(&mut self, cached_frame: &CachedFrame<'a>, slot: u16) -> RunResult<()> {
-        let cell_id = self.cell_id_from_local(cached_frame, slot);
+        let cell_id = self.cell_id_from_local(cached_frame, slot)?;
         let value = match self.heap.get(cell_id) {
             HeapData::Cell(c) => c.0.clone_with_heap(self),
-            _ => panic!("LoadCell: entry is not a Cell"),
+            _ => return Err(RunError::internal("LoadCell: entry is not a Cell")),
         };
 
         // Check for undefined value - raise NameError for unbound free variable
@@ -1913,11 +2144,15 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Extracts the cell `HeapId` from a local variable slot on the stack.
     ///
-    /// Cell variables are stored as `Value::Ref(cell_id)` in the frame's locals region.
-    fn cell_id_from_local(&self, cached_frame: &CachedFrame<'_>, slot: u16) -> HeapId {
+    /// Cell variables are stored as `Value::Ref(cell_id)` in the frame's locals region. A slot
+    /// holding anything else is reported as an internal error for the reason given on
+    /// [`Self::load_cell`]: the interpreter must fail as an interpreter, not abort its host.
+    fn cell_id_from_local(&self, cached_frame: &CachedFrame<'_>, slot: u16) -> RunResult<HeapId> {
         match &self.stack[cached_frame.stack_base + slot as usize] {
-            Value::Ref(cell_id) => *cell_id,
-            other => panic!("LoadCell/StoreCell: expected cell reference in local slot {slot}, found {other:?}"),
+            Value::Ref(cell_id) => Ok(*cell_id),
+            other => Err(RunError::internal(format!(
+                "LoadCell/StoreCell: expected cell reference in local slot {slot}, found {other:?}"
+            ))),
         }
     }
 
@@ -1932,18 +2167,22 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Pops the top of stack and stores it in a closure cell.
     ///
-    /// The cell `HeapId` is read from the frame's local variable slot on the stack.
-    fn store_cell(&mut self, cached_frame: &CachedFrame<'_>, slot: u16) {
+    /// The cell `HeapId` is read from the frame's local variable slot on the stack. A slot that does
+    /// not hold a cell is reported as an internal error for the reason given on
+    /// [`Self::load_cell`]; the `HeapGuard` releases the popped value on that path, so an error
+    /// leaks nothing.
+    fn store_cell(&mut self, cached_frame: &CachedFrame<'_>, slot: u16) -> RunResult<()> {
         let value = self.pop();
-        // The guard will clean up the new value if we panic, or the old value if we swap
+        // The guard will clean up the new value if we return early, or the old value if we swap
         let mut guard = HeapGuard::new(value, self);
         let (value, this) = guard.as_parts_mut();
 
-        let cell_id = this.cell_id_from_local(cached_frame, slot);
+        let cell_id = this.cell_id_from_local(cached_frame, slot)?;
         let HeapReadOutput::Cell(mut cell) = this.heap.read(cell_id) else {
-            panic!("StoreCell: entry is not a Cell")
+            return Err(RunError::internal("StoreCell: entry is not a Cell"));
         };
         mem::swap(&mut cell.get_mut(this.heap).0, value);
+        Ok(())
     }
 }
 
