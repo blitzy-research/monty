@@ -87,6 +87,14 @@ impl MontyIter {
     ///   to push a frame ("IP sync deferred to error path"). Do not pre-fetch a first value.
     /// - Callability is validated **eagerly**, matching CPython's `iter(v, w): v must be
     ///   callable`, so a bad first argument fails at construction rather than on first use.
+    /// - Inherited: an **inline** callable that captures a local of an enclosing *function* aborts
+    ///   when it is invoked. A lambda or nested `def` written inside a `for`-statement header or an
+    ///   `if` condition is compiled without the cell its capture needs, so `LoadCell: entry is not a
+    ///   Cell` panics on the first call and `for v in iter(lambda: buf.pop(0), 0):` inside a function
+    ///   never runs. The defect is in the compiler's cell allocation for closures created in those
+    ///   positions rather than here - untouched `sorted(key=...)` and `map()` abort identically with
+    ///   no `iter()` involved, and that is where it has to be fixed. Binding the callable to a name
+    ///   first is the working form, which is what the fixtures for this feature use throughout.
     /// - The two-argument form owns **two** values while `collect_child_ids` follows only one edge
     ///   out of an iterator, so both are moved into a two-element `(callable, sentinel)` tuple whose
     ///   single owning reference becomes `value`; `iter_value` keeps a non-owning mirror of that id.
@@ -728,6 +736,15 @@ fn get_heap_item(
 ///   is the error that reaches this function. Every other exception propagates unchanged in type and
 ///   message; a failing comparison arrives as a `ResourceError`, whose `RunError` conversion decides
 ///   catchability.
+/// - **Inherited: the stop test has no identity shortcut, so a NaN sentinel never stops.** CPython
+///   compares through `PyObject_RichCompareBool`, which reports equal for the *same object* before it
+///   consults `==`; [`Value::py_eq`] has no such fast path, so a callable handing back the very NaN it
+///   was given as the sentinel stops in CPython and drives forever here - bounded only by the resource
+///   tracker, never by the sentinel. The gap belongs to the shared comparison layer, where `x in [x]`,
+///   `[x].count(x)`, `[x].index(x)` and container `==` all diverge the same way with no iterator
+///   involved, so it has to be closed there; special-casing identity at this one call site would hide
+///   a systemic divergence behind a local fix and contradict the `==`-not-identity contract on
+///   [`MontyIter::init`].
 /// - **Dispatchable is not completable: an external callable fails on the first step.** When the call
 ///   resolves to an external, OS-call, method-call or await result, `VM::evaluate_function` hands back
 ///   `RunError::internal` reading "iter(callable, sentinel): external functions are not yet supported
